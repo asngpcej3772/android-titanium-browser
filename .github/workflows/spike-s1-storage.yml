@@ -1,0 +1,173 @@
+# SPIKE S1 - STORAGE AND SYNC TRUTH (MEASUREMENT ONLY, NO COMPILE)
+#
+# Purpose: replace every guessed disk/time number with a measured fact.
+# This workflow NEVER runs autoninja, NEVER signs anything, NEVER pushes
+# anything, and requests read-only repository permissions.
+#
+# It reproduces EXACTLY the source acquisition that upstream build.sh performs
+# (shallow single-tag fetch + gclient sync -D --no-history --nohooks) and
+# prints df/du after every stage.
+#
+# PIN-BEFORE-USE: every third-party action below is marked "TODO PIN".
+# Replace the version tag with a full 40-character commit SHA before running.
+# See docs/FORK_SETUP_GUIDE.md section 7 for how to obtain the SHA.
+
+name: spike-s1-storage
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_reclaim:
+        description: 'Run aggressive disk reclamation before measuring'
+        type: boolean
+        default: true
+      do_runhooks:
+        description: 'Also run gclient runhooks (pulls toolchains, much bigger)'
+        type: boolean
+        default: true
+      do_install_build_deps:
+        description: 'Also run build/install-build-deps.sh --no-prompt'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@v5   # TODO PIN to 40-char SHA
+        with:
+          submodules: true
+
+      - name: M00 baseline machine report
+        run: |
+          echo "----- cores -----"; nproc
+          echo "----- memory -----"; free -g
+          echo "----- disks -----"; df -h; echo; df -h /; echo; df -h /mnt || true
+          echo "----- block devices -----"; lsblk || true
+          echo "----- kernel / os -----"; uname -a; lsb_release -a || true
+
+      - name: M01 prove which Titanium version this fork is pinned to
+        run: |
+          echo "----- repo HEAD -----"
+          git log -1 --format='%H %ci %s'
+          echo "----- vanadium submodule commit -----"
+          git -C vanadium log -1 --format='%H %ci' || echo 'SUBMODULE NOT CHECKED OUT'
+          echo "----- version strings from vanadium/args.gn -----"
+          grep -E 'android_default_version_(name|code)' vanadium/args.gn || echo 'NOT FOUND'
+          echo "----- VERSION as build.sh would compute it -----"
+          grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' vanadium/args.gn
+          echo "----- patch counts (expect 291 and 5) -----"
+          ls -1 vanadium/patches/*.patch | wc -l
+          ls -1 vanadium/subprojects_patches/*/*.patch | wc -l
+
+      - name: M02 disk reclamation
+        if: ${{ inputs.do_reclaim }}
+        uses: jlumbroso/free-disk-space@main   # TODO PIN to 40-char SHA
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: false
+
+      - name: M03 disk after reclamation
+        run: df -h /; echo; df -h
+
+      - name: M04 apt prerequisites (same list as upstream build.sh)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          date +%s > /tmp/t_apt_start
+          sudo apt-get update
+          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libgcc-s1:i386
+          echo "elapsed_apt_seconds=$(( $(date +%s) - $(cat /tmp/t_apt_start) ))"
+          df -h /
+
+      - name: M05 depot_tools (shallow)
+        run: |
+          date +%s > /tmp/t_dt_start
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /tmp/depot_tools
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - $(cat /tmp/t_dt_start) ))"
+          du -sh /tmp/depot_tools
+          df -h /
+
+      - name: M06 shallow single-tag Chromium fetch (identical to build.sh)
+        run: |
+          export PATH="/tmp/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' vanadium/args.gn)
+          echo "VERSION=$VERSION"
+          date +%s > /tmp/t_fetch_start
+          mkdir -p chromium/src/out/Default
+          cd chromium/src
+          git init -q
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          git checkout -q "$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - $(cat /tmp/t_fetch_start) ))"
+          echo '----- MEASUREMENT A: src tree after shallow tag fetch -----'
+          du -sh .
+          du -sh .git
+          df -h /
+
+      - name: M07 gclient sync -D --no-history --nohooks (identical to build.sh)
+        run: |
+          export PATH="/tmp/depot_tools:$PATH"
+          cp .gclient chromium/.gclient
+          echo '----- .gclient in use -----'; cat chromium/.gclient
+          date +%s > /tmp/t_sync_start
+          cd chromium/src
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO - capture output above'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - $(cat /tmp/t_sync_start) ))"
+          echo '----- MEASUREMENT B: total checkout after sync, no hooks -----'
+          du -sh /home/runner/work/*/*/chromium 2>/dev/null || true
+          df -h /
+
+      - name: M08 top space consumers after sync (bloat evidence)
+        run: |
+          cd chromium/src
+          echo '----- third_party children, largest 40 -----'
+          du -sh third_party/* 2>/dev/null | sort -rh | head -n 40
+          echo '----- top level, largest 25 -----'
+          du -sh * 2>/dev/null | sort -rh | head -n 25
+
+      - name: M09 gclient runhooks
+        if: ${{ inputs.do_runhooks }}
+        run: |
+          export PATH="/tmp/depot_tools:$PATH"
+          date +%s > /tmp/t_hooks_start
+          cd chromium/src
+          gclient runhooks || echo 'RUNHOOKS RETURNED NONZERO - capture output above'
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - $(cat /tmp/t_hooks_start) ))"
+          echo '----- MEASUREMENT C: total checkout after runhooks -----'
+          du -sh .
+          du -sh third_party/* 2>/dev/null | sort -rh | head -n 40
+          df -h /
+
+      - name: M10 install-build-deps
+        if: ${{ inputs.do_install_build_deps }}
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          cd chromium/src
+          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
+          echo '----- MEASUREMENT D: disk after build deps -----'
+          df -h /
+
+      - name: M11 FINAL SUMMARY
+        if: always()
+        run: |
+          echo '================ SPIKE S1 SUMMARY ================'
+          df -h /
+          du -sh chromium 2>/dev/null || true
+          du -sh chromium/src/.git 2>/dev/null || true
+          echo 'Copy this entire log back into the chat.'
