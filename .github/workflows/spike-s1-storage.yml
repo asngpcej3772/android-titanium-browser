@@ -1,16 +1,23 @@
 # SPIKE S1 - STORAGE AND SYNC TRUTH (MEASUREMENT ONLY, NO COMPILE)
 #
-# Purpose: replace every guessed disk/time number with a measured fact.
-# This workflow NEVER runs autoninja, NEVER signs anything, NEVER pushes
-# anything, and requests read-only repository permissions.
+# REVISION 2 (Session 009): the third-party disk-reclaim action has been REMOVED
+# and replaced with inline shell. The ONLY external action left is
+# actions/checkout, which is published by GitHub itself.
+# Rationale: during research an obfuscated prompt-injection payload was found in
+# the README of a competing disk-reclaim action. Inline shell means every command
+# that runs on our runner is visible in this file and reviewed by us.
 #
-# It reproduces EXACTLY the source acquisition that upstream build.sh performs
-# (shallow single-tag fetch + gclient sync -D --no-history --nohooks) and
-# prints df/du after every stage.
+# This workflow NEVER compiles, NEVER signs, NEVER pushes, and declares
+# read-only repository permissions. timeout-minutes is below the 6-hour hard cap.
 #
-# PIN-BEFORE-USE: every third-party action below is marked "TODO PIN".
-# Replace the version tag with a full 40-character commit SHA before running.
-# See docs/FORK_SETUP_GUIDE.md section 7 for how to obtain the SHA.
+# Two space strategies are used together:
+#   1. INLINE RECLAIM - delete preinstalled toolchains we do not use, measuring
+#      the yield of every group so reclamation itself becomes evidence.
+#   2. THE TEMP DISK - GitHub-hosted Linux runners mount a large secondary temp
+#      disk (commonly at /mnt) which is usually far bigger than free space on /.
+#      Step M03 measures it and, if it is the roomier volume, the entire Chromium
+#      checkout is placed there. This is strictly better than reclaiming / and it
+#      needs no third-party code at all.
 
 name: spike-s1-storage
 
@@ -18,7 +25,11 @@ on:
   workflow_dispatch:
     inputs:
       do_reclaim:
-        description: 'Run aggressive disk reclamation before measuring'
+        description: 'Inline-delete unused preinstalled toolchains'
+        type: boolean
+        default: true
+      prefer_temp_disk:
+        description: 'Place the checkout on the large temp disk (/mnt) if it is roomier'
         type: boolean
         default: true
       do_runhooks:
@@ -39,7 +50,7 @@ jobs:
     timeout-minutes: 350
     steps:
       - name: Checkout fork with vanadium submodule
-        uses: actions/checkout@v5   # TODO PIN to 40-char SHA
+        uses: actions/checkout@v5   # TODO PIN to 40-char SHA (GitHub-published action)
         with:
           submodules: true
 
@@ -47,94 +58,167 @@ jobs:
         run: |
           echo "----- cores -----"; nproc
           echo "----- memory -----"; free -g
-          echo "----- disks -----"; df -h; echo; df -h /; echo; df -h /mnt || true
+          echo "----- all filesystems -----"; df -h
+          echo "----- root -----"; df -h /
+          echo "----- temp disk candidate -----"; df -h /mnt || echo 'no /mnt'
           echo "----- block devices -----"; lsblk || true
-          echo "----- kernel / os -----"; uname -a; lsb_release -a || true
+          echo "----- os -----"; uname -a; lsb_release -a || true
 
       - name: M01 prove which Titanium version this fork is pinned to
         run: |
           echo "----- repo HEAD -----"
           git log -1 --format='%H %ci %s'
-          echo "----- vanadium submodule commit -----"
+          echo "----- vanadium submodule commit (expect 593cf8ce1237c37419b58c42ab7d5d110ca45af4) -----"
           git -C vanadium log -1 --format='%H %ci' || echo 'SUBMODULE NOT CHECKED OUT'
           echo "----- version strings from vanadium/args.gn -----"
           grep -E 'android_default_version_(name|code)' vanadium/args.gn || echo 'NOT FOUND'
-          echo "----- VERSION as build.sh would compute it -----"
+          echo "----- VERSION as build.sh would compute it (expect 150.0.7871.124) -----"
           grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' vanadium/args.gn
           echo "----- patch counts (expect 291 and 5) -----"
           ls -1 vanadium/patches/*.patch | wc -l
           ls -1 vanadium/subprojects_patches/*/*.patch | wc -l
 
-      - name: M02 disk reclamation
+      - name: M02 INLINE disk reclamation (no third-party action)
         if: ${{ inputs.do_reclaim }}
-        uses: jlumbroso/free-disk-space@main   # TODO PIN to 40-char SHA
-        with:
-          tool-cache: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -n1 | tr -d ' '; }
+          BEFORE_TOTAL=$(avail)
+          group() {
+            label="$1"; shift
+            before=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(sudo du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              else
+                echo "  absent   $p"
+              fi
+            done
+            after=$(avail)
+            echo "GROUP $label reclaimed $(( (after - before) / 1024 )) MB"
+          }
+          echo '=== WHAT WE KEEP ON PURPOSE ==='
+          echo 'system python3 (depot_tools needs it), system JDK (install-build-deps may want it),'
+          echo 'git, curl, and anything Chromium fetches itself under third_party.'
+          echo
+          echo '=== G1 Android SDK/NDK preinstalled on the runner ==='
+          echo '(Chromium downloads its OWN android_sdk and android_ndk under third_party via'
+          echo ' gclient hooks, so the runner copy is dead weight for us.)'
+          group G1-android /usr/local/lib/android
+          echo '=== G2 .NET ==='
+          group G2-dotnet /usr/share/dotnet
+          echo '=== G3 Haskell / GHC ==='
+          group G3-haskell /opt/ghc /usr/local/.ghcup
+          echo '=== G4 Swift ==='
+          group G4-swift /usr/share/swift
+          echo '=== G5 misc SDKs and caches we never invoke ==='
+          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
+                       /usr/local/share/chromium /usr/local/lib/node_modules \
+                       /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
+                       /usr/local/graalvm /opt/pipx
+          echo '=== G6 hosted tool cache ==='
+          echo '(Safe here because we use no actions/setup-* steps; /usr/bin/python3 is untouched.)'
+          group G6-toolcache /opt/hostedtoolcache
+          echo '=== G7 docker images ==='
+          sudo docker image ls -a 2>/dev/null || true
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          echo '=== G8 large apt packages ==='
+          b8=$(avail)
+          sudo apt-get remove -y --purge -qq firefox google-chrome-stable microsoft-edge-stable \
+            azure-cli mono-devel 'llvm-*' 'libllvm*' 'mysql-*' 'postgresql-*' 2>/dev/null
+          sudo apt-get autoremove -y --purge -qq 2>/dev/null
+          sudo apt-get clean 2>/dev/null
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          AFTER_TOTAL=$(avail)
+          echo
+          echo "===== TOTAL INLINE RECLAIM: $(( (AFTER_TOTAL - BEFORE_TOTAL) / 1024 )) MB ====="
+          df -h /
+          exit 0
 
-      - name: M03 disk after reclamation
-        run: df -h /; echo; df -h
+      - name: M03 choose the roomier volume for the checkout
+        run: |
+          set -e
+          ROOT_AVAIL=$(df --output=avail -k / | tail -n1 | tr -d ' ')
+          MNT_AVAIL=0
+          if [ -d /mnt ]; then
+            MNT_AVAIL=$(df --output=avail -k /mnt 2>/dev/null | tail -n1 | tr -d ' ' || echo 0)
+          fi
+          echo "available on /    : $(( ROOT_AVAIL / 1024 )) MB"
+          echo "available on /mnt : $(( MNT_AVAIL / 1024 )) MB"
+          WORKDIR="$GITHUB_WORKSPACE/ti-build"
+          if [ "${{ inputs.prefer_temp_disk }}" = "true" ] && [ "$MNT_AVAIL" -gt "$ROOT_AVAIL" ]; then
+            WORKDIR=/mnt/ti-build
+            sudo mkdir -p "$WORKDIR"
+            sudo chown -R "$(id -u):$(id -g)" "$WORKDIR"
+            echo 'DECISION: temp disk /mnt is roomier -> checkout goes there'
+          else
+            mkdir -p "$WORKDIR"
+            echo 'DECISION: staying on / (either /mnt is smaller or the option was off)'
+          fi
+          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
+          echo "WORKDIR is $WORKDIR"
+          df -h "$WORKDIR"
 
-      - name: M04 apt prerequisites (same list as upstream build.sh)
+      - name: M04 apt prerequisites (identical list to upstream build.sh)
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          date +%s > /tmp/t_apt_start
+          t0=$(date +%s)
           sudo apt-get update
           sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
           sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y libgcc-s1:i386
-          echo "elapsed_apt_seconds=$(( $(date +%s) - $(cat /tmp/t_apt_start) ))"
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
           df -h /
 
       - name: M05 depot_tools (shallow)
         run: |
-          date +%s > /tmp/t_dt_start
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git /tmp/depot_tools
-          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - $(cat /tmp/t_dt_start) ))"
-          du -sh /tmp/depot_tools
-          df -h /
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORKDIR/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+          du -sh "$WORKDIR/depot_tools"
+          df -h "$WORKDIR"
 
       - name: M06 shallow single-tag Chromium fetch (identical to build.sh)
         run: |
-          export PATH="/tmp/depot_tools:$PATH"
-          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' vanadium/args.gn)
+          export PATH="$WORKDIR/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
           echo "VERSION=$VERSION"
-          date +%s > /tmp/t_fetch_start
-          mkdir -p chromium/src/out/Default
-          cd chromium/src
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          t0=$(date +%s)
+          mkdir -p "$WORKDIR/chromium/src/out/Default"
+          cd "$WORKDIR/chromium/src"
           git init -q
           git remote add origin https://chromium.googlesource.com/chromium/src.git
           git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
           git checkout -q "$VERSION"
-          echo "elapsed_fetch_seconds=$(( $(date +%s) - $(cat /tmp/t_fetch_start) ))"
-          echo '----- MEASUREMENT A: src tree after shallow tag fetch -----'
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- MEASUREMENT A: src tree after shallow single-tag fetch -----'
           du -sh .
           du -sh .git
-          df -h /
+          df -h "$WORKDIR"
 
       - name: M07 gclient sync -D --no-history --nohooks (identical to build.sh)
         run: |
-          export PATH="/tmp/depot_tools:$PATH"
-          cp .gclient chromium/.gclient
-          echo '----- .gclient in use -----'; cat chromium/.gclient
-          date +%s > /tmp/t_sync_start
-          cd chromium/src
-          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO - capture output above'
-          echo "elapsed_sync_seconds=$(( $(date +%s) - $(cat /tmp/t_sync_start) ))"
-          echo '----- MEASUREMENT B: total checkout after sync, no hooks -----'
-          du -sh /home/runner/work/*/*/chromium 2>/dev/null || true
-          df -h /
+          export PATH="$WORKDIR/depot_tools:$PATH"
+          cp "$GITHUB_WORKSPACE/.gclient" "$WORKDIR/chromium/.gclient"
+          echo '----- .gclient in use -----'; cat "$WORKDIR/chromium/.gclient"
+          t0=$(date +%s)
+          cd "$WORKDIR/chromium/src"
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO - see output above'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- MEASUREMENT B: whole checkout after sync, no hooks -----'
+          du -sh "$WORKDIR/chromium"
+          df -h "$WORKDIR"
 
-      - name: M08 top space consumers after sync (bloat evidence)
+      - name: M08 largest space consumers after sync (bloat evidence for A18)
         run: |
-          cd chromium/src
+          cd "$WORKDIR/chromium/src"
           echo '----- third_party children, largest 40 -----'
           du -sh third_party/* 2>/dev/null | sort -rh | head -n 40
           echo '----- top level, largest 25 -----'
@@ -143,31 +227,33 @@ jobs:
       - name: M09 gclient runhooks
         if: ${{ inputs.do_runhooks }}
         run: |
-          export PATH="/tmp/depot_tools:$PATH"
-          date +%s > /tmp/t_hooks_start
-          cd chromium/src
-          gclient runhooks || echo 'RUNHOOKS RETURNED NONZERO - capture output above'
-          echo "elapsed_runhooks_seconds=$(( $(date +%s) - $(cat /tmp/t_hooks_start) ))"
-          echo '----- MEASUREMENT C: total checkout after runhooks -----'
-          du -sh .
+          export PATH="$WORKDIR/depot_tools:$PATH"
+          t0=$(date +%s)
+          cd "$WORKDIR/chromium/src"
+          gclient runhooks || echo 'RUNHOOKS RETURNED NONZERO - see output above'
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- MEASUREMENT C: whole checkout after runhooks (replaces the 100 GB myth) -----'
+          du -sh "$WORKDIR/chromium"
           du -sh third_party/* 2>/dev/null | sort -rh | head -n 40
-          df -h /
+          df -h "$WORKDIR"
 
       - name: M10 install-build-deps
         if: ${{ inputs.do_install_build_deps }}
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
-          cd chromium/src
+          cd "$WORKDIR/chromium/src"
           ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
           echo '----- MEASUREMENT D: disk after build deps -----'
           df -h /
+          df -h "$WORKDIR"
 
       - name: M11 FINAL SUMMARY
         if: always()
         run: |
           echo '================ SPIKE S1 SUMMARY ================'
-          df -h /
-          du -sh chromium 2>/dev/null || true
-          du -sh chromium/src/.git 2>/dev/null || true
+          echo "WORKDIR=${WORKDIR:-unset}  VERSION=${VERSION:-unset}"
+          df -h
+          du -sh "${WORKDIR:-/nonexistent}/chromium" 2>/dev/null || true
+          du -sh "${WORKDIR:-/nonexistent}/chromium/src/.git" 2>/dev/null || true
           echo 'Copy this entire log back into the chat.'
