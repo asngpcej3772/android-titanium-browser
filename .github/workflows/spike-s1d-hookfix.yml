@@ -1,0 +1,305 @@
+name: spike-s1d-hookfix
+
+# Spike S1d - diagnose the upstream apply_subprojects_patches.py crash,
+# apply the 5 subproject patches manually as a workaround, run the hooks to
+# completion for a TRUE MEASUREMENT C, then produce a real build graph and
+# ninja target and edge count.
+#
+# Measurement and diagnosis only. No compile, no signing, no push, no release.
+# Permissions are read-only. No third-party actions (DEC-029).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DEBIAN_FRONTEND: noninteractive
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: Q00 baseline
+        run: |
+          nproc; free -g; df -h /
+          git --version
+
+      - name: Q01 version proof
+        run: |
+          git log -1 --format='%H %ci %s'
+          git -C vanadium log -1 --format='%H %ci'
+          grep -E 'android_default_version_(name|code)' vanadium/args.gn
+          echo "patches      : $(ls -1 vanadium/patches/*.patch | wc -l)"
+          echo "subprojects  : $(find vanadium/subprojects_patches -name '*.patch' | wc -l)"
+          find vanadium/subprojects_patches -name '*.patch' | sort
+
+      - name: Q02 PRINT THE UPSTREAM SCRIPT - settles the crash question
+        run: |
+          echo '===== apply_subprojects_patches.py FULL SOURCE ====='
+          cat -n vanadium/tools/common/apply_subprojects_patches.py
+          echo '===== filter_list_download.py FULL SOURCE ====='
+          cat -n vanadium/tools/filter_lists/filter_list_download.py
+
+      - name: Q03 inline disk reclamation
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -1; }
+          BEFORE=$(avail)
+          group() {
+            local label=$1; shift; local b=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              else
+                echo "  absent   $p"
+              fi
+            done
+            local a=$(avail)
+            echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
+          }
+          group G1-android /usr/local/lib/android
+          group G2-dotnet /usr/share/dotnet
+          group G3-haskell /opt/ghc /usr/local/.ghcup
+          group G4-swift /usr/share/swift
+          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
+                        /usr/local/share/chromium /usr/local/lib/node_modules \
+                        /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
+                        /usr/local/graalvm /opt/pipx
+          group G6-toolcache /opt/hostedtoolcache
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          b8=$(avail)
+          echo '----- OQ-24: what is actually installed before purge -----'
+          dpkg -l firefox google-chrome-stable microsoft-edge-stable powershell mono-devel libgl1-mesa-dri 2>&1 | tail -n 12
+          sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable powershell mono-devel libgl1-mesa-dri >/dev/null 2>&1
+          sudo apt-get autoremove -y >/dev/null 2>&1
+          sudo apt-get clean >/dev/null 2>&1
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          echo "===== TOTAL INLINE RECLAIM: $(( ($(avail) - BEFORE) / 1024 )) MB ====="
+          df -h /
+
+      - name: Q04 apt prerequisites
+        run: |
+          t0=$(date +%s)
+          sudo apt-get update
+          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libgcc-s1:i386
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: Q05 depot_tools
+        run: |
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: Q06 shallow single-tag Chromium fetch
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          t0=$(date +%s)
+          mkdir -p "$GITHUB_WORKSPACE/chromium/src/out/Default"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git init -q
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          git checkout -q "$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          du -sh . ; du -sh .git ; df -h /
+
+      - name: Q07 pruning and rename (build.sh lines 18-28)
+        run: |
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
+          S="$GITHUB_WORKSPACE"
+          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
+          rm -rf $S/vanadium/patches/*component-updates.patch
+          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
+          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          t0=$(date +%s)
+          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
+          echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: Q08 git am the pruned patch series
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git config user.email spike@example.invalid
+          git config user.name spike
+          t0=$(date +%s)
+          git am --whitespace=nowarn --keep-non-patch $GITHUB_WORKSPACE/vanadium/patches/*.patch > /tmp/am.log 2>&1
+          rc=$?
+          echo "elapsed_git_am_seconds=$(( $(date +%s) - t0 ))"
+          echo "git_am_exit_code=$rc"
+          echo "applying_lines: $(grep -c '^Applying: ' /tmp/am.log)"
+          if [ $rc -ne 0 ]; then
+            echo "failed at patch number: $(cat .git/rebase-apply/next 2>/dev/null)"
+            git am --show-current-patch=diff 2>/dev/null | head -n 40
+          fi
+          ls -la titanium 2>/dev/null | head -n 10
+
+      - name: Q09 STREAM DISCRIMINATION - does git am write Applying to stdout or stderr
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          rm -rf /tmp/streamtest && mkdir -p /tmp/streamtest
+          cd /tmp/streamtest
+          git init -q probe && cd probe
+          git config user.email spike@example.invalid
+          git config user.name spike
+          echo base > f.txt
+          git add f.txt
+          git commit -q -m base
+          echo changed > f.txt
+          git add f.txt
+          git commit -q -m change
+          git format-patch -1 -o /tmp/streamtest/patches >/dev/null
+          git reset --hard -q HEAD~1
+          git am /tmp/streamtest/patches/*.patch > /tmp/streamtest/out.txt 2> /tmp/streamtest/err.txt
+          echo "git am exit: $?"
+          echo "stdout bytes: $(stat -c%s /tmp/streamtest/out.txt)"
+          echo "stderr bytes: $(stat -c%s /tmp/streamtest/err.txt)"
+          echo '----- STDOUT -----'; cat /tmp/streamtest/out.txt
+          echo '----- STDERR -----'; cat /tmp/streamtest/err.txt
+          echo 'VERDICT: whichever stream carries "Applying:" explains the IndexError'
+
+      - name: Q10 gclient sync --nohooks
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          t0=$(date +%s)
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: Q11 reproduce the crash with both streams captured
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium"
+          echo '----- subproject repo state BEFORE any patching -----'
+          git -C src/v8 log --oneline -3 2>&1 | head -n 5
+          git -C src/v8 status --porcelain 2>&1 | head -n 10
+          echo "v8 is a git repo: $(test -d src/v8/.git && echo yes || echo no)"
+          git -C src/third_party/search_engines_data/resources log --oneline -3 2>&1 | head -n 5
+          echo '----- run the upstream script directly, streams separated -----'
+          python3 ../vanadium/tools/common/apply_subprojects_patches.py \
+            --base_patch_dir ../vanadium/subprojects_patches --src_dir src \
+            > /tmp/sub_out.txt 2> /tmp/sub_err.txt
+          echo "script exit: $?"
+          echo "stdout bytes: $(stat -c%s /tmp/sub_out.txt)"; cat /tmp/sub_out.txt
+          echo "stderr bytes: $(stat -c%s /tmp/sub_err.txt)"; cat /tmp/sub_err.txt
+
+      - name: Q12 WORKAROUND - apply the 5 subproject patches manually
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          apply_dir() {
+            local target=$1; local patchdir=$2
+            echo "===== $target <- $patchdir ====="
+            if [ ! -d "$target" ]; then echo "TARGET MISSING $target"; return; fi
+            ( cd "$target"
+              git config user.email spike@example.invalid
+              git config user.name spike
+              for p in $patchdir/*.patch; do
+                echo "--- $p"
+                git am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 5
+                rc=${PIPESTATUS[0]}
+                if [ $rc -ne 0 ]; then
+                  echo "git am failed rc=$rc, aborting and trying git apply --3way"
+                  git am --abort 2>/dev/null
+                  git apply -p1 --3way "$p" 2>&1 | tail -n 5
+                  echo "git apply rc=$?"
+                fi
+              done )
+          }
+          V="$GITHUB_WORKSPACE/vanadium/subprojects_patches"
+          apply_dir v8 "$V/v8"
+          apply_dir third_party/search_engines_data/resources "$V/third_party/search_engines_data/resources"
+          echo '----- PROOF: does v8 now allow drumbrake on Android -----'
+          grep -n -B4 -A12 'is_drumbrake_supported' v8/BUILD.gn | head -n 60
+
+      - name: Q13 run hooks to completion for a TRUE MEASUREMENT C
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium"
+          echo '----- neutralise hook 2 locally (runner-local .gclient only, nothing committed) -----'
+          python3 -c "import re; p='.gclient'; s=open(p).read(); out=re.sub(r'[{][^{}]*apply_subprojects_patches[^{}]*[}][ ,]*', '', s, flags=re.S); open(p,'w').write(out); print('hook2 present after edit:', 'apply_subprojects_patches' in out)"
+          echo '----- resulting .gclient -----'
+          cat -n .gclient
+          cd src
+          t0=$(date +%s)
+          gclient runhooks || echo 'RUNHOOKS RETURNED NONZERO'
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- VALIDITY GATE (Rule 18) -----'
+          if [ -s titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
+            echo "HOOK1 PASS filter list bytes: $(stat -c%s titanium/android_config/filter_lists/filter_lists_easylist.txt)"
+          else
+            echo 'HOOK1 FAIL - MEASUREMENT C IS INVALID'
+          fi
+          echo "clang present: $(ls -1 third_party/llvm-build/Release+Asserts/bin/clang 2>/dev/null || echo NO)"
+          echo '----- TRUE MEASUREMENT C -----'
+          du -sh "$GITHUB_WORKSPACE/chromium"
+          du -sh third_party/* 2>/dev/null | sort -rh | head -n 40
+          df -h /
+
+      - name: Q14 install-build-deps
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
+          df -h /
+
+      - name: Q15 patch.sh then gn gen then REAL target and edge count
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          source "$GITHUB_WORKSPACE/common.sh" 2>/dev/null
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          t0=$(date +%s)
+          source "$GITHUB_WORKSPACE/patch.sh"
+          echo "patch_sh_exit_code=$?"
+          echo "elapsed_patch_sh_seconds=$(( $(date +%s) - t0 ))"
+          cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
+          sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          echo '----- args.gn in effect -----'
+          cat -n out/Default/args.gn
+          t0=$(date +%s)
+          gn gen out/Default || echo 'GN GEN RETURNED NONZERO'
+          echo "gn_gen_exit_code=$?"
+          echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- REAL ninja target count -----'
+          ninja -C out/Default -t targets all 2>/dev/null | wc -l
+          echo '----- edges required for chrome_public_apk (the compile-size number) -----'
+          ninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l
+          ninja -C out/Default -n chrome_public_apk 2>&1 | tail -n 5
+          df -h /
+
+      - name: Q16 FINAL SUMMARY
+        if: always()
+        run: |
+          echo '================ SPIKE S1d SUMMARY ================'
+          df -h /
+          du -sh "$GITHUB_WORKSPACE/chromium" 2>/dev/null || true
+          echo 'Copy this entire log back into the chat.'
