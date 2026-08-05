@@ -1,0 +1,202 @@
+name: spike-s1b-runhooks
+
+# PURPOSE
+#   Spike S1 obtained MEASUREMENT A, B and D but FAILED to obtain C, because the
+#   .gclient hooks use paths relative to the directory that CONTAINS chromium
+#   ('../vanadium/tools/...'). S1 placed chromium under a separate WORKDIR while
+#   vanadium stayed in the repo checkout, so the hook path did not resolve.
+#
+#   THE FIX IS ONE LINE OF LAYOUT: build inside $GITHUB_WORKSPACE, exactly the
+#   way upstream build.sh does it, so the tree is
+#       $GITHUB_WORKSPACE/vanadium          (the submodule)
+#       $GITHUB_WORKSPACE/chromium/src      (the checkout)
+#   and '../vanadium' resolves correctly.
+#
+#   S1 also measured that this runner image has NO separate temp disk (/mnt is
+#   not a distinct mount; one 150 G disk, 88 G free before reclaim), so the
+#   WORKDIR indirection has lost its only purpose and is gone.
+#
+# STILL MEASUREMENT ONLY: no compile, no signing, no pushes. contents: read.
+# No third-party actions (DEC-029). actions/checkout is pinned by SHA (DEC-025).
+
+on:
+  workflow_dispatch:
+    inputs:
+      do_reclaim:
+        description: 'Run the inline disk reclamation'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  measure:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: true
+
+      - name: N00 baseline
+        run: |
+          nproc; free -g; df -h /
+
+      - name: N01 version proof and the OQ-21 patch count question
+        run: |
+          echo '----- repo HEAD -----'
+          git log -1 --format='%H %ci %s'
+          echo '----- vanadium submodule commit -----'
+          git -C vanadium log -1 --format='%H %ci'
+          echo '----- version strings -----'
+          grep -E 'android_default_version_(name|code)' vanadium/args.gn
+          echo '----- patches (expect 291) -----'
+          ls -1 vanadium/patches/*.patch | wc -l
+          echo '----- OQ-21: subproject patches counted THREE ways -----'
+          echo "glob depth 2 : $(ls -1 vanadium/subprojects_patches/*/*.patch 2>/dev/null | wc -l)"
+          echo "glob depth 1 : $(ls -1 vanadium/subprojects_patches/*.patch 2>/dev/null | wc -l)"
+          echo "recursive    : $(find vanadium/subprojects_patches -name '*.patch' | wc -l)"
+          echo '----- full layout so the count can never be ambiguous again -----'
+          find vanadium/subprojects_patches -type f | sort
+
+      - name: N02 inline disk reclamation (same eight groups as S1)
+        if: ${{ inputs.do_reclaim }}
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -n1 | tr -d ' '; }
+          BEFORE=$(avail)
+          group() {
+            label="$1"; shift
+            b=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(sudo du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              else
+                echo "  absent   $p"
+              fi
+            done
+            a=$(avail)
+            echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
+          }
+          group G1-android /usr/local/lib/android
+          group G2-dotnet /usr/share/dotnet
+          group G3-haskell /opt/ghc /usr/local/.ghcup
+          group G4-swift /usr/share/swift
+          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
+                        /usr/local/share/chromium /usr/local/lib/node_modules \
+                        /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
+                        /usr/local/graalvm /opt/pipx
+          group G6-toolcache /opt/hostedtoolcache
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          b8=$(avail)
+          sudo apt-get remove -y --purge -qq firefox google-chrome-stable microsoft-edge-stable \
+            azure-cli mono-devel 'llvm-*' 'libllvm*' 'mysql-*' 'postgresql-*' 2>/dev/null
+          sudo apt-get autoremove -y --purge -qq 2>/dev/null
+          sudo apt-get clean 2>/dev/null
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          echo "===== TOTAL INLINE RECLAIM: $(( ($(avail) - BEFORE) / 1024 )) MB ====="
+          df -h /
+          exit 0
+
+      - name: N03 apt prerequisites (identical list to upstream build.sh)
+        run: |
+          t0=$(date +%s)
+          sudo apt-get update
+          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libgcc-s1:i386
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: N04 depot_tools
+        run: |
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: N05 shallow single-tag Chromium fetch (MEASUREMENT A again, as control)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          t0=$(date +%s)
+          mkdir -p "$GITHUB_WORKSPACE/chromium/src/out/Default"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git init -q
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          git checkout -q "$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- MEASUREMENT A (control, S1 said 6.9G src / 1.5G .git) -----'
+          du -sh . ; du -sh .git ; df -h /
+
+      - name: N06 gclient sync --nohooks (MEASUREMENT B again, as control)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cp "$GITHUB_WORKSPACE/.gclient" "$GITHUB_WORKSPACE/chromium/.gclient"
+          echo '----- proof the hook path will now resolve -----'
+          ls -la "$GITHUB_WORKSPACE/vanadium/tools/filter_lists/filter_list_download.py"
+          ls -la "$GITHUB_WORKSPACE/vanadium/tools/common/apply_subprojects_patches.py"
+          t0=$(date +%s)
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- MEASUREMENT B (control, S1 said 35G) -----'
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: N07 gclient runhooks - THE POINT OF THIS SPIKE (MEASUREMENT C)
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          t0=$(date +%s)
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          gclient runhooks || echo 'RUNHOOKS RETURNED NONZERO - see output above'
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- MEASUREMENT C: whole checkout AFTER hooks -----'
+          du -sh "$GITHUB_WORKSPACE/chromium"
+          echo '----- what the hooks actually produced -----'
+          ls -la src/titanium/android_config/filter_lists/ 2>/dev/null || \
+            ls -la titanium/android_config/filter_lists/ 2>/dev/null || echo 'filter list output not found at either path'
+          echo '----- C minus B, by directory: top 40 third_party -----'
+          du -sh third_party/* 2>/dev/null | sort -rh | head -n 40
+          df -h /
+
+      - name: N08 install-build-deps (MEASUREMENT D again, as control)
+        run: |
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
+          echo '----- MEASUREMENT D -----'
+          df -h /
+
+      - name: N09 gn gen only - can the build graph even be generated?
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo 'NOTE: unpatched args.gn on purpose. This is a graph test, not our build.'
+          cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
+          sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          echo '----- args.gn in use -----'
+          cat out/Default/args.gn
+          t0=$(date +%s)
+          gn gen out/Default || echo 'GN GEN RETURNED NONZERO - expected without patch.sh, capture the reason'
+          echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- how many build targets would ninja have? -----'
+          ninja -C out/Default -t targets all 2>/dev/null | wc -l || echo 'ninja target count unavailable'
+          df -h /
+
+      - name: N10 FINAL SUMMARY
+        if: always()
+        run: |
+          echo '================ SPIKE S1b SUMMARY ================'
+          df -h /
+          du -sh "$GITHUB_WORKSPACE/chromium" 2>/dev/null || true
+          echo 'Copy this entire log back into the chat.'
