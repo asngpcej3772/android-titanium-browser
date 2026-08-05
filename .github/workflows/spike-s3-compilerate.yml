@@ -1,0 +1,297 @@
+name: spike-s3-compilerate
+
+# SPIKE S3 - measure the arm64 compile rate for chrome_public_apk on a free
+# 4-core GitHub-hosted runner. This is the ONLY open half of blocker D2.
+#
+# RULE 19: every preceding stage of the upstream pipeline is reproduced verbatim
+# from build.sh, in order, with no shortcuts.
+# DEC-032: a GLOBAL git identity is set before any patching. This is the proven
+# fix for the upstream apply_subprojects_patches.py IndexError, and step R10
+# doubles as the test of that fix against the UNMODIFIED .gclient.
+# DEC-025: actions pinned by 40-char SHA. DEC-029: zero third-party actions.
+# DEC-026: nothing is deleted from the checkout to make numbers look better.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMPILE_BUDGET_SECONDS: "16200"
+      SAMPLE_INTERVAL_SECONDS: "300"
+
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: R00 baseline
+        run: |
+          nproc; free -g; df -h /
+          git --version
+          echo "runner_os=$RUNNER_OS arch=$(uname -m)"
+
+      - name: R01 version proof
+        run: |
+          git log -1 --format='%H %ci %s'
+          git -C vanadium log -1 --format='%H %ci'
+          grep -E 'android_default_version_(name|code)' vanadium/args.gn
+          echo "patches      : $(ls -1 vanadium/patches/*.patch | wc -l)"
+          echo "subprojects  : $(find vanadium/subprojects_patches -name '*.patch' | wc -l)"
+
+      - name: R02 inline disk reclamation
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -1; }
+          BEFORE=$(avail)
+          group() {
+            local label=$1; shift; local b=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              else
+                echo "  absent   $p"
+              fi
+            done
+            local a=$(avail)
+            echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
+          }
+          group G1-android /usr/local/lib/android
+          group G2-dotnet /usr/share/dotnet
+          group G3-haskell /opt/ghc /usr/local/.ghcup
+          group G4-swift /usr/share/swift
+          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
+                        /usr/local/share/chromium /usr/local/lib/node_modules \
+                        /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
+                        /usr/local/graalvm /opt/pipx
+          group G6-toolcache /opt/hostedtoolcache
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          b8=$(avail)
+          sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable powershell libgl1-mesa-dri >/dev/null 2>&1
+          sudo apt-get autoremove -y >/dev/null 2>&1
+          sudo apt-get clean >/dev/null 2>&1
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          echo "===== TOTAL INLINE RECLAIM: $(( ($(avail) - BEFORE) / 1024 )) MB ====="
+          df -h /
+
+      - name: R03 apt prerequisites
+        run: |
+          t0=$(date +%s)
+          sudo apt-get update
+          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libgcc-s1:i386
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R04 depot_tools
+        run: |
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R05 shallow single-tag Chromium fetch
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          t0=$(date +%s)
+          mkdir -p "$GITHUB_WORKSPACE/chromium/src/out/Default"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git init -q
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          git checkout -q "$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          du -sh . ; du -sh .git ; df -h /
+
+      - name: R06 GLOBAL git identity (DEC-032 - the proven fix)
+        run: |
+          git config --global user.email spike@example.invalid
+          git config --global user.name spike
+          git config --global --list | grep -E 'user\.(name|email)'
+          echo 'identity is global, so every subproject repo inherits it'
+
+      - name: R07 pruning and rename (build.sh lines 18-28)
+        run: |
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
+          S="$GITHUB_WORKSPACE"
+          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
+          rm -rf $S/vanadium/patches/*component-updates.patch
+          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
+          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          t0=$(date +%s)
+          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
+          echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R08 git am the pruned patch series
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          git am --whitespace=nowarn --keep-non-patch $GITHUB_WORKSPACE/vanadium/patches/*.patch > /tmp/am.log 2>&1
+          rc=$?
+          echo "elapsed_git_am_seconds=$(( $(date +%s) - t0 ))"
+          echo "git_am_exit_code=$rc"
+          echo "applying_lines: $(grep -c '^Applying: ' /tmp/am.log)"
+          if [ $rc -ne 0 ]; then tail -n 40 /tmp/am.log; fi
+
+      - name: R09 gclient sync --nohooks
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          t0=$(date +%s)
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: R10 gclient runhooks with the UNMODIFIED .gclient - tests DEC-032
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          echo 'hook2 present in .gclient:' $(grep -c apply_subprojects_patches "$GITHUB_WORKSPACE/chromium/.gclient")
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          gclient runhooks > /tmp/hooks.log 2>&1
+          rc=$?
+          echo "runhooks_exit_code=$rc"
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- IndexError present in hook output (0 means DEC-032 fixed it) -----'
+          grep -c IndexError /tmp/hooks.log
+          echo '----- subproject patch application lines -----'
+          grep -E 'Applied successfully|Skipping patch application|aborting previous' /tmp/hooks.log
+          echo '----- last 30 lines of hook output -----'
+          tail -n 30 /tmp/hooks.log
+          echo '----- VALIDITY GATE 1 (Rule 18): filter list -----'
+          if [ -s titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
+            echo "HOOK1 PASS filter list bytes: $(stat -c%s titanium/android_config/filter_lists/filter_lists_easylist.txt)"
+          else
+            echo 'HOOK1 FAIL'
+          fi
+          echo '----- VALIDITY GATE 2: are the v8 drumbrake patches in v8 history -----'
+          git -C v8 log --oneline -3
+          if git -C v8 log --oneline -5 | grep -qi drumbrake; then
+            echo 'V8 SUBPROJECT PATCHES PRESENT via hook'
+          else
+            echo 'V8 SUBPROJECT PATCHES ABSENT - applying manually as fallback'
+            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/v8/*.patch; do
+              git -C v8 am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
+            done
+            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/third_party/search_engines_data/resources/*.patch; do
+              git -C third_party/search_engines_data/resources am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
+            done
+            git -C v8 log --oneline -3
+          fi
+          echo "clang present: $(ls -1 third_party/llvm-build/Release+Asserts/bin/clang 2>/dev/null || echo NO)"
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: R11 install-build-deps
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
+          df -h /
+
+      - name: R12 patch.sh then args.gn arm64 then gn gen
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          source "$GITHUB_WORKSPACE/common.sh" 2>/dev/null
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          t0=$(date +%s)
+          source "$GITHUB_WORKSPACE/patch.sh" > /tmp/patch_sh.log 2>&1
+          echo "patch_sh_exit_code=$?"
+          echo "elapsed_patch_sh_seconds=$(( $(date +%s) - t0 ))"
+          echo "patch_sh_log_lines: $(wc -l < /tmp/patch_sh.log)"
+          cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
+          sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          grep -n 'target_cpu' out/Default/args.gn
+          t0=$(date +%s)
+          gn gen out/Default || echo 'GN GEN RETURNED NONZERO'
+          echo "gn_gen_exit_code=$?"
+          echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
+          echo "ninja_edges_for_apk: $(ninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
+          df -h /
+
+      - name: R13 TIMED COMPILE - the S3 measurement
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo "budget_seconds=$COMPILE_BUDGET_SECONDS sample_interval=$SAMPLE_INTERVAL_SECONDS"
+          START=$(date +%s)
+          echo "compile_start_epoch=$START"
+          nohup autoninja -C out/Default chrome_public_apk > /tmp/build.log 2>&1 &
+          BPID=$!
+          echo "build_pid=$BPID"
+          while kill -0 "$BPID" 2>/dev/null; do
+            NOW=$(date +%s); EL=$(( NOW - START ))
+            if [ "$EL" -ge "$COMPILE_BUDGET_SECONDS" ]; then
+              echo "BUDGET REACHED at ${EL}s - stopping the build to preserve the sample"
+              kill -INT "$BPID" 2>/dev/null; sleep 20; kill -9 "$BPID" 2>/dev/null
+              break
+            fi
+            LASTP=$(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log 2>/dev/null | tail -n 1)
+            echo "SAMPLE elapsed=${EL}s progress=${LASTP:-none} load=$(cut -d' ' -f1-3 /proc/loadavg) free=$(df --output=avail -k / | tail -1)"
+            sleep "$SAMPLE_INTERVAL_SECONDS"
+          done
+          wait "$BPID" 2>/dev/null
+          BRC=$?
+          END=$(date +%s)
+          echo "build_exit_code=$BRC"
+          echo "elapsed_compile_seconds=$(( END - START ))"
+          echo '----- last 40 lines of build output -----'
+          tail -n 40 /tmp/build.log
+          echo '----- final progress counter -----'
+          grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log | tail -n 1
+          echo '----- error lines in build output -----'
+          grep -c -iE '^(FAILED|ninja: build stopped|error:)' /tmp/build.log
+          grep -iE '^(FAILED|ninja: build stopped)' /tmp/build.log | head -n 20
+
+      - name: R14 compile-rate arithmetic and artefacts
+        if: always()
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo '----- ninja log (edge completion records) -----'
+          if [ -f out/Default/.ninja_log ]; then
+            echo "ninja_log_lines: $(wc -l < out/Default/.ninja_log)"
+          else
+            echo 'no .ninja_log'
+          fi
+          ls -1 out/Default | grep -iE 'siso|ninja' | head -n 20
+          echo '----- rate arithmetic from the sampled numbers -----'
+          python3 -c "import re,sys;t=open('/tmp/build.log',errors='replace').read();m=re.findall(r'\[(\d+)/(\d+)\]',t);print('progress records:',len(m));print('last done/total:',m[-1] if m else 'none')"
+          echo '----- did an APK appear -----'
+          find out/Default -maxdepth 2 -name '*.apk' -o -maxdepth 2 -name '*.aab' | head -n 20
+          find out/Default -maxdepth 2 -name '*.apk' -printf '%s %p\n' 2>/dev/null | head -n 20
+          echo '----- disk -----'
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: R15 FINAL SUMMARY
+        if: always()
+        run: |
+          echo '================ SPIKE S3 SUMMARY ================'
+          df -h /
+          du -sh "$GITHUB_WORKSPACE/chromium" 2>/dev/null || true
+          echo 'Copy this entire log back into the chat.'
