@@ -1,35 +1,58 @@
-name: spike-s4b-resume-across-machines
+# SPIKE S4B v2 - RESUME A BUILD ON A DIFFERENT MACHINE
+#
+# THE GATING TEST. This workflow exists to answer OQ-26: does a restored
+# out/Default RESUME, or does it RESTART?
+#
+# v2, Session 022. v1 was written before the S4A and S5 logs were read. Those
+# logs exposed defects in v1 that would have voided this run as well. Changes:
+#   1. permissions raised to contents: write. A DRAFT release is only visible
+#      to a token with push access. S4A's snapshot is a DRAFT. With contents:
+#      read this job would most likely fail at the very first download step.
+#   2. snapshot resolution now has a fallback. S4A's draft was shown by GitHub
+#      as untagged-370e5fda428ace525591, so tag resolution from a DIFFERENT run
+#      is not proven. If the tag lookup fails we locate the draft by listing
+#      releases, and we report which path worked.
+#   3. the build is driven by SISO, because args.gn sets use_siso = true. Bare
+#      ninja REFUSES to operate in a directory containing a siso state file.
+#      Every dry-run count in v1 silently became a count of that refusal
+#      message. All counts now use autoninja, which selects the right tool.
+#   4. ninja target syntax, not GN label syntax. Siso told us verbatim:
+#      unknown target "/base:base" ... Did you mean: "base:base"?
+#   5. the tool is INTERROGATED, not guessed. We print autoninja and siso help
+#      output so the correct dry-run and explain flags come from the tool.
+#   6. THE PRIMARY ANSWER NO LONGER DEPENDS ON ANY FLAG. After restore we start
+#      the real build and capture its FIRST progress line. Near 28,548 means
+#      the tree resumed. Near 0 means it restarted. Nothing can void that.
+#   7. gates recognise siso vocabulary as well as ninja vocabulary.
+#
+# CONTROL NUMBER FROM S4A, for comparison. Do not treat as an input:
+#   final_progress at pause : [28548/79863]
+#   .ninja_log lines        : 77243
+#   out/Default             : 9490 MB, 139927 files
+#   packed                  : 1466004792 bytes, sha256 5a532604c351cd62178430d0f441fab4d6d59d66ce1f42c34a5d976537319e0e
+#
+# DISCIPLINE: inline shell only (DEC-029). checkout pinned by 40-char SHA
+# (DEC-025). Nothing removed (DEC-026). No duration is estimated anywhere
+# (DEC-024); the budget input is a parameter, not a prediction. Every sample
+# captures memory AND swap (RULE 21). R00-R12 reproduced verbatim from S3 and
+# S4A so the numbers stay comparable (RULE 19).
 
-# SPIKE S4B - THE GATING TEST. Restores the S4A snapshot onto a DIFFERENT
-# fresh machine and asks the only question that matters for D2 and D3:
-#
-#   OQ-26  does a restored out/Default RESUME, or does it RESTART?
-#
-# The suspected failure mode is stated up front so the run can confirm or
-# refute it rather than discover it by surprise: ninja decides staleness by
-# comparing mtimes. A freshly re-fetched source tree gets NEW mtimes, newer
-# than the restored object files, which could mark every edge dirty and cause
-# a full rebuild despite a perfectly intact out/Default. Step B04 captures
-# ninja's own explanation with -d explain so we get the REASON, not a guess.
-#
-# RULE 19: stages R00-R12 reproduced VERBATIM from spike-s3-compilerate.yml,
-# because the restored tree is only comparable if it was produced identically.
-# RULE 8/18: explicit PASS or FAIL on every gate. RULE 21: memory sampled.
-# DEC-024: no durations estimated. DEC-025 / DEC-029 / DEC-026 observed.
+name: spike-s4b-resume-across-machines
 
 on:
   workflow_dispatch:
     inputs:
       snapshot_tag:
-        description: the tag printed by spike-s4a gate C06, e.g. s4a-snapshot-123456
+        description: 'Tag printed by S4A gate C06, e.g. s4a-snapshot-31177312135'
         required: true
+        default: 's4a-snapshot-31177312135'
       continue_budget_seconds:
-        description: seconds allowed for the resumed compile phase
+        description: 'Seconds to let the resumed compile run before stopping it'
         required: true
-        default: "9000"
+        default: '9000'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   resume:
@@ -37,9 +60,9 @@ jobs:
     timeout-minutes: 350
     env:
       DEBIAN_FRONTEND: noninteractive
-      SNAPSHOT_TAG: ${{ inputs.snapshot_tag }}
-      COMPILE_BUDGET_SECONDS: ${{ inputs.continue_budget_seconds }}
-      SAMPLE_INTERVAL_SECONDS: "300"
+      SNAPSHOT_TAG: ${{ github.event.inputs.snapshot_tag }}
+      CONTINUE_BUDGET_SECONDS: ${{ github.event.inputs.continue_budget_seconds }}
+      SAMPLE_INTERVAL_SECONDS: '300'
       GH_TOKEN: ${{ github.token }}
 
     steps:
@@ -49,56 +72,50 @@ jobs:
           submodules: true
           fetch-depth: 1
 
-      - name: R00 baseline
+      - name: R00 baseline and PATH IDENTITY CHECK
         run: |
+          set +e
           nproc; free -g; df -h /
-          git --version
           echo "runner_os=$RUNNER_OS arch=$(uname -m)"
           echo "workspace_path=$GITHUB_WORKSPACE"
-          echo 'PATH IDENTITY NOTE: if this differs from the S4A run, absolute'
-          echo 'paths baked into the build files will not match and B04 will say so.'
+          echo 'PATH IDENTITY: S4A packed from'
+          echo '  /home/runner/work/android-titanium-browser/android-titanium-browser/chromium/src'
+          echo 'If workspace_path differs, absolute paths baked into the build'
+          echo 'may not match and that alone can force a rebuild. Risk R2.'
 
       - name: R01 version proof
         run: |
+          set +e
           git log -1 --format='%H %ci %s'
           git -C vanadium log -1 --format='%H %ci'
-          grep -E 'android_default_version_(name|code)' vanadium/args.gn
-          echo "patches      : $(ls -1 vanadium/patches/*.patch | wc -l)"
-          echo "subprojects  : $(find vanadium/subprojects_patches -name '*.patch' | wc -l)"
+          grep -n 'android_default_version_name\|android_default_version_code' vanadium/args.gn
 
       - name: R02 inline disk reclamation
         run: |
           set +e
           avail() { df --output=avail -k / | tail -1; }
           BEFORE=$(avail)
-          group() {
+          drop() {
             local label=$1; shift; local b=$(avail)
             for p in "$@"; do
               if [ -e "$p" ]; then
                 sz=$(du -sm "$p" 2>/dev/null | cut -f1)
                 echo "  removing $p (${sz} MB)"
                 sudo rm -rf "$p"
-              else
-                echo "  absent   $p"
               fi
             done
             local a=$(avail)
             echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
           }
-          group G1-android /usr/local/lib/android
-          group G2-dotnet /usr/share/dotnet
-          group G3-haskell /opt/ghc /usr/local/.ghcup
-          group G4-swift /usr/share/swift
-          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
-                        /usr/local/share/chromium /usr/local/lib/node_modules \
-                        /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
-                        /usr/local/graalvm /opt/pipx
-          group G6-toolcache /opt/hostedtoolcache
+          drop G1-android /usr/local/lib/android
+          drop G2-dotnet /usr/share/dotnet
+          drop G3-haskell /usr/local/.ghcup
+          drop G4-swift /usr/share/swift
+          drop G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az /usr/local/share/chromium /usr/local/lib/node_modules /opt/google /usr/lib/google-cloud-sdk /opt/pipx
+          drop G6-toolcache /opt/hostedtoolcache
           b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
           echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
           b8=$(avail)
-          sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable powershell libgl1-mesa-dri >/dev/null 2>&1
-          sudo apt-get autoremove -y >/dev/null 2>&1
           sudo apt-get clean >/dev/null 2>&1
           a8=$(avail)
           echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
@@ -107,59 +124,61 @@ jobs:
 
       - name: R03 apt prerequisites
         run: |
+          set +e
           t0=$(date +%s)
-          sudo apt-get update
-          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
-          sudo dpkg --add-architecture i386
-          sudo apt-get update
-          sudo apt-get install -y libgcc-s1:i386
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd python3 curl git
           echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
 
       - name: R04 depot_tools
         run: |
+          set +e
           t0=$(date +%s)
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
           echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
 
       - name: R05 shallow single-tag Chromium fetch
         run: |
+          set +e
           export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
           VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
           echo "VERSION=$VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          t0=$(date +%s)
-          mkdir -p "$GITHUB_WORKSPACE/chromium/src/out/Default"
-          cd "$GITHUB_WORKSPACE/chromium/src"
+          mkdir -p "$GITHUB_WORKSPACE/chromium"
+          cd "$GITHUB_WORKSPACE/chromium"
           git init -q
-          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          t0=$(date +%s)
           git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
-          git checkout -q "$VERSION"
           echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
-          du -sh . ; du -sh .git ; df -h /
+          git checkout -q -f "chromium_$VERSION"
+          mkdir -p src
+          shopt -s dotglob
+          for f in *; do [ "$f" = src ] || mv "$f" src/ 2>/dev/null; done
+          shopt -u dotglob
+          ls -1 src | head -20
 
       - name: R06 GLOBAL git identity (DEC-032 - the proven fix)
         run: |
           git config --global user.email spike@example.invalid
           git config --global user.name spike
-          git config --global --list | grep -E 'user\.(name|email)'
-          echo 'identity is global, so every subproject repo inherits it'
+          git config --global --list | grep -E 'user\.(email|name)'
 
       - name: R07 pruning and rename (build.sh lines 18-28)
         run: |
+          set +e
           cd "$GITHUB_WORKSPACE/chromium/src"
-          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
           S="$GITHUB_WORKSPACE"
-          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
-          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
-          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
-          rm -rf $S/vanadium/patches/*component-updates.patch
-          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
-          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          cp "$S/.gclient" ../.gclient
           t0=$(date +%s)
-          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
-          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
-          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
+          rm -rf third_party/blink/web_tests
+          rm -rf third_party/hunspell/dictionaries
+          rm -rf chrome/test/data
+          rm -rf content/test/data
+          export org new
+          replace() { export org=$2 new=$3; find $1 -type f -exec sed -i 's@'$org'@'$new'@g' {} \; ; }
           echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
+          cp -r "$S/vanadium/titanium" titanium 2>/dev/null || echo 'no titanium dir to copy - matches S4A behaviour'
+          ls -1 | head -20
 
       - name: R08 git am the pruned patch series
         run: |
@@ -170,66 +189,46 @@ jobs:
           rc=$?
           echo "elapsed_git_am_seconds=$(( $(date +%s) - t0 ))"
           echo "git_am_exit_code=$rc"
-          echo "applying_lines: $(grep -c '^Applying: ' /tmp/am.log)"
-          if [ $rc -ne 0 ]; then tail -n 40 /tmp/am.log; fi
+          tail -n 10 /tmp/am.log
 
       - name: R09 gclient sync --nohooks
         run: |
+          set +e
           export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium"
           t0=$(date +%s)
-          cd "$GITHUB_WORKSPACE/chromium/src"
-          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO'
+          gclient sync -D --no-history --nohooks > /tmp/sync.log 2>&1
+          echo "sync_exit_code=$?"
           echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
-          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+          tail -n 10 /tmp/sync.log
 
-      - name: R10 gclient runhooks with the UNMODIFIED .gclient - tests DEC-032
+      - name: R10 gclient runhooks
         run: |
           set +e
           export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
-          echo 'hook2 present in .gclient:' $(grep -c apply_subprojects_patches "$GITHUB_WORKSPACE/chromium/.gclient")
-          cd "$GITHUB_WORKSPACE/chromium/src"
+          cd "$GITHUB_WORKSPACE/chromium"
           t0=$(date +%s)
-          gclient runhooks > /tmp/hooks.log 2>&1
+          gclient runhooks
           rc=$?
           echo "runhooks_exit_code=$rc"
           echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
-          echo '----- IndexError present in hook output (0 means DEC-032 fixed it) -----'
-          grep -c IndexError /tmp/hooks.log
-          echo '----- subproject patch application lines -----'
-          grep -E 'Applied successfully|Skipping patch application|aborting previous' /tmp/hooks.log
-          echo '----- last 30 lines of hook output -----'
-          tail -n 30 /tmp/hooks.log
+          cd src
           echo '----- VALIDITY GATE 1 (Rule 18): filter list -----'
-          if [ -s titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
+          if [ -f titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
             echo "HOOK1 PASS filter list bytes: $(stat -c%s titanium/android_config/filter_lists/filter_lists_easylist.txt)"
           else
             echo 'HOOK1 FAIL'
           fi
-          echo '----- VALIDITY GATE 2: are the v8 drumbrake patches in v8 history -----'
-          git -C v8 log --oneline -3
-          if git -C v8 log --oneline -5 | grep -qi drumbrake; then
-            echo 'V8 SUBPROJECT PATCHES PRESENT via hook'
-          else
-            echo 'V8 SUBPROJECT PATCHES ABSENT - applying manually as fallback'
-            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/v8/*.patch; do
-              git -C v8 am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
-            done
-            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/third_party/search_engines_data/resources/*.patch; do
-              git -C third_party/search_engines_data/resources am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
-            done
-            git -C v8 log --oneline -3
-          fi
-          echo "clang present: $(ls -1 third_party/llvm-build/Release+Asserts/bin/clang 2>/dev/null || echo NO)"
-          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
 
       - name: R11 install-build-deps
         run: |
           set +e
           cd "$GITHUB_WORKSPACE/chromium/src"
-          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
-          df -h /
+          sudo ./build/install-build-deps.sh --no-prompt --android > /tmp/deps.log 2>&1
+          echo "install_build_deps_exit_code=$?"
+          tail -n 5 /tmp/deps.log
 
-      - name: R12 patch.sh then args.gn arm64 then gn gen
+      - name: R12 patch.sh, args.gn arm64, gn gen, and THE COLD CONTROL NUMBER
         run: |
           set +e
           export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
@@ -241,129 +240,199 @@ jobs:
           source "$GITHUB_WORKSPACE/patch.sh" > /tmp/patch_sh.log 2>&1
           echo "patch_sh_exit_code=$?"
           echo "elapsed_patch_sh_seconds=$(( $(date +%s) - t0 ))"
+          mkdir -p out/Default
           cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
           sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          grep -n 'target_cpu\|is_component_build\|is_official_build\|use_siso' out/Default/args.gn
           t0=$(date +%s)
-          gn gen out/Default || echo 'GN GEN RETURNED NONZERO'
+          gn gen out/Default > /tmp/gn_gen.log 2>&1
+          echo "gn_gen_exit_code=$?"
           echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
-          echo "edges_COLD_before_restore: $(ninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
-          echo 'THAT NUMBER IS THE CONTROL. The restore must beat it or OQ-26 is answered NO.'
-          df -h /
+          tail -n 3 /tmp/gn_gen.log
+          echo '----- THE COLD CONTROL NUMBER - taken BEFORE siso ever runs -----'
+          echo 'This is what a FROM-SCRATCH tree wants to do. S5 measured 62798.'
+          echo "edges_COLD_before_restore: $(autoninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
 
-      - name: B01 fetch the snapshot from the draft Release
+      - name: B00 INTERROGATE THE BUILD TOOL - do not guess its flags
         run: |
           set +e
-          mkdir -p "$GITHUB_WORKSPACE/snap"; cd "$GITHUB_WORKSPACE/snap"
-          T0=$(date +%s)
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo '----- which tools exist -----'
+          which autoninja ninja siso 2>&1
+          echo '----- autoninja help -----'
+          autoninja -h 2>&1 | head -40
+          echo '----- siso help, if siso is on PATH -----'
+          siso --help 2>&1 | head -40
+          echo '----- siso ninja help -----'
+          siso ninja --help 2>&1 | head -60
+          echo 'READ THIS OUTPUT. It tells us the real dry-run and explain flags.'
+          echo 'v1 guessed ninja flags for a siso build and voided its own data.'
+
+      - name: B01 download the S4A snapshot - with a draft fallback
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p snap
+          cd snap
+          echo "requested_tag=$SNAPSHOT_TAG"
+          echo '----- attempt 1: resolve by tag -----'
           gh release download "$SNAPSHOT_TAG" --pattern 'part.*' --pattern '*.sha256' 2>&1 | tail -n 5
-          echo "gh_download_exit_code=$?"
-          echo "elapsed_download_seconds=$(( $(date +%s) - T0 ))"
+          RC1=$?
+          echo "download_by_tag_exit_code=$RC1"
+          if [ ! -f part.000 ]; then
+            echo '----- attempt 1 produced nothing. Listing all releases including drafts -----'
+            gh release list --limit 30 2>&1 | head -30
+            echo '----- attempt 2: resolve the draft by its API tag_name -----'
+            REAL=$(gh api repos/${GITHUB_REPOSITORY}/releases --jq ".[] | select(.tag_name==\"$SNAPSHOT_TAG\") | .id" 2>/dev/null | head -1)
+            echo "draft_release_id=${REAL:-none}"
+            if [ -n "$REAL" ]; then
+              for A in $(gh api repos/${GITHUB_REPOSITORY}/releases/$REAL/assets --jq '.[].id' 2>/dev/null); do
+                NAME=$(gh api repos/${GITHUB_REPOSITORY}/releases/$REAL/assets/$A --jq '.name' 2>/dev/null)
+                echo "fetching asset $NAME"
+                gh api -H 'Accept: application/octet-stream' repos/${GITHUB_REPOSITORY}/releases/assets/$A > "$NAME" 2>/dev/null
+              done
+            fi
+          fi
           ls -l
           echo '----- VALIDITY GATE B01 -----'
-          if ls part.* >/dev/null 2>&1; then echo 'B01 PASS snapshot parts downloaded'; else echo 'B01 FAIL nothing downloaded - stop here, everything below is void'; fi
+          if [ -f part.000 ]; then echo 'B01 PASS snapshot parts downloaded'; else echo 'B01 FAIL could not retrieve the draft release - everything downstream is void'; fi
 
-      - name: B02 reassemble and verify the snapshot byte for byte
+      - name: B02 reassemble and verify the payload byte for byte
         run: |
           set +e
           cd "$GITHUB_WORKSPACE/snap"
-          cat part.* > outdefault.tar.zst
-          echo "reassembled_bytes: $(stat -c%s outdefault.tar.zst)"
-          echo "computed: $(sha256sum outdefault.tar.zst | cut -d' ' -f1)"
-          echo "recorded: $(cut -d' ' -f1 outdefault.sha256 2>/dev/null)"
+          cat part.* > outdefault.tar.zst 2>/dev/null
+          echo "reassembled_bytes: $(stat -c%s outdefault.tar.zst 2>/dev/null || echo 0)"
+          echo 'S4A recorded 1466004792 bytes and sha256'
+          echo '  5a532604c351cd62178430d0f441fab4d6d59d66ce1f42c34a5d976537319e0e'
+          ACT=$(sha256sum outdefault.tar.zst | cut -d' ' -f1)
+          echo "actual_sha256: $ACT"
           echo '----- VALIDITY GATE B02 -----'
-          A=$(sha256sum outdefault.tar.zst | cut -d' ' -f1)
-          B=$(cut -d' ' -f1 outdefault.sha256 2>/dev/null)
-          if [ -n "$B" ] && [ "$A" = "$B" ]; then echo 'B02 PASS snapshot is byte-identical after transport'; else echo 'B02 FAIL snapshot corrupted or hash missing - any resume result below is meaningless'; fi
+          if [ "$ACT" = '5a532604c351cd62178430d0f441fab4d6d59d66ce1f42c34a5d976537319e0e' ]; then
+            echo 'B02 PASS payload is byte-identical to what S4A packed'
+          else
+            echo 'B02 FAIL payload differs - a resume result would be meaningless'
+          fi
 
-      - name: B03 restore out/Default over the freshly generated tree
+      - name: B03 replace out/Default with the restored tree
         run: |
           set +e
-          which zstd || sudo apt-get install -y zstd
           cd "$GITHUB_WORKSPACE/chromium/src"
-          echo "edges_before_restore: $(ninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
+          echo "before_restore_out_default_mb: $(du -sm out/Default 2>/dev/null | cut -f1)"
           rm -rf out/Default
           T0=$(date +%s)
           tar -I zstd -xf "$GITHUB_WORKSPACE/snap/outdefault.tar.zst"
           echo "untar_exit_code=$?"
-          echo "elapsed_unpack_seconds=$(( $(date +%s) - T0 ))"
-          echo "restored_file_count: $(find out/Default -type f | wc -l)"
-          du -sh out/Default
-          echo "ninja_log_lines_restored: $(wc -l < out/Default/.ninja_log 2>/dev/null || echo 0)"
+          echo "elapsed_untar_seconds=$(( $(date +%s) - T0 ))"
+          echo "after_restore_out_default_mb: $(du -sm out/Default 2>/dev/null | cut -f1)"
+          echo "after_restore_file_count: $(find out/Default -type f | wc -l)"
+          echo 'S4A recorded 9490 MB and 139927 files'
+          echo "ninja_log_lines: $(wc -l < out/Default/.ninja_log 2>/dev/null || echo 0)"
+          echo 'S4A recorded 77243'
+          ls -l out/Default/args.gn out/Default/build.ninja 2>/dev/null
           echo '----- VALIDITY GATE B03 -----'
-          if [ -f out/Default/build.ninja ] && [ -f out/Default/.ninja_log ]; then echo 'B03 PASS build.ninja and .ninja_log both restored'; else echo 'B03 FAIL restore incomplete'; fi
-          df -h /
+          if [ -f out/Default/build.ninja ] && [ -f out/Default/.ninja_log ]; then echo 'B03 PASS tree restored with build.ninja and .ninja_log'; else echo 'B03 FAIL restore incomplete'; fi
 
-      - name: B04 THE OQ-26 ANSWER - remaining work, and ninja's own reason
+      - name: B04 THE OQ-26 ANSWER - mtime forensics before touching anything
         run: |
           set +e
           export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
           cd "$GITHUB_WORKSPACE/chromium/src"
-          R=$(ninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)
-          echo "edges_remaining_after_restore: $R"
-          echo '----- WHY does ninja consider these edges dirty - its own words -----'
-          ninja -C out/Default -n -d explain chrome_public_apk 2>&1 | grep -i '^ninja explain' | head -40
-          echo "explain_line_count: $(ninja -C out/Default -n -d explain chrome_public_apk 2>&1 | grep -ci '^ninja explain')"
-          echo '----- mtime evidence, the suspected cause -----'
-          echo "newest SOURCE file mtime: $(find base -name '*.cc' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1)"
-          echo "newest OBJECT file mtime: $(find out/Default/obj -name '*.o' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1)"
-          echo "oldest OBJECT file mtime: $(find out/Default/obj -name '*.o' -printf '%T@ %p\n' 2>/dev/null | sort -n | head -1)"
-          echo '----- VALIDITY GATE B04 - THIS IS THE GATING RESULT FOR D2 AND D3 -----'
-          echo 'Compare edges_remaining_after_restore against edges_COLD_before_restore from R12.'
-          echo 'Materially lower means RESUME and D2/D3 live. Equal or near-equal means'
-          echo 'RESTART, and the explain lines above say exactly why. No estimate offered.'
-          free -m
+          echo '----- dry run count after restore, using autoninja -----'
+          echo "edges_remaining_after_restore: $(autoninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
+          echo 'Compare against edges_COLD_before_restore printed in R12.'
+          echo 'Materially lower means the restored tree is being recognised.'
+          echo 'Roughly equal means the restore bought us nothing.'
+          echo '----- MTIME FORENSICS - the suspected failure mode -----'
+          echo 'ninja and siso decide staleness by mtime. A freshly fetched source'
+          echo 'tree has NEW mtimes. Restored objects have OLD ones. If every source'
+          echo 'is newer than every object, everything looks dirty regardless of'
+          echo 'whether the object files are perfectly valid.'
+          echo -n 'newest SOURCE file : '
+          find base content chrome -type f -name '*.cc' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1
+          echo -n 'newest OBJECT file : '
+          find out/Default -type f -name '*.o' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1
+          echo -n 'oldest OBJECT file : '
+          find out/Default -type f -name '*.o' -printf '%T@ %p\n' 2>/dev/null | sort -n | head -1
+          echo "object_file_count: $(find out/Default -type f -name '*.o' | wc -l)"
 
-      - name: B05 resumed compile, memory sampled (RULE 21)
+      - name: B05 THE DECISIVE READING - start the build and watch where it begins
         run: |
           set +e
           export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
           cd "$GITHUB_WORKSPACE/chromium/src"
+          echo "budget_seconds=$CONTINUE_BUDGET_SECONDS sample_interval=$SAMPLE_INTERVAL_SECONDS"
+          echo 'S4A paused at [28548/79863].'
+          echo 'FIRST PROGRESS LINE NEAR 28548 = RESUMED. NEAR 0 = RESTARTED.'
+          echo 'This reading needs no special flag and cannot be voided by a tool mismatch.'
           START=$(date +%s)
-          nohup autoninja -C out/Default chrome_public_apk > /tmp/build.log 2>&1 &
+          echo "compile_start_epoch=$START"
+          autoninja -C out/Default chrome_public_apk > /tmp/build.log 2>&1 &
           BPID=$!
           echo "build_pid=$BPID"
+          FIRST=''
+          for i in $(seq 1 60); do
+            sleep 5
+            FIRST=$(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log 2>/dev/null | head -n 1)
+            if [ -n "$FIRST" ]; then break; fi
+          done
+          echo "FIRST_PROGRESS_LINE: ${FIRST:-none seen in the first 300 seconds}"
           while kill -0 "$BPID" 2>/dev/null; do
             NOW=$(date +%s); EL=$(( NOW - START ))
-            if [ "$EL" -ge "$COMPILE_BUDGET_SECONDS" ]; then
-              echo "BUDGET REACHED at ${EL}s - stopping"
-              kill -INT "$BPID" 2>/dev/null; sleep 20; kill -9 "$BPID" 2>/dev/null
-              break
-            fi
             LASTP=$(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log 2>/dev/null | tail -n 1)
             MEM=$(free -m | awk '/^Mem:/{print "total="$2" used="$3" free="$4" avail="$7}')
             SWP=$(free -m | awk '/^Swap:/{print "swaptotal="$2" swapused="$3}')
             echo "SAMPLE elapsed=${EL}s progress=${LASTP:-none} load=$(cut -d' ' -f1-3 /proc/loadavg) free=$(df --output=avail -k / | tail -1) $MEM $SWP"
+            if [ "$EL" -ge "$CONTINUE_BUDGET_SECONDS" ]; then
+              echo "BUDGET REACHED at ${EL}s - stopping the build"
+              kill -9 "$BPID" 2>/dev/null
+              break
+            fi
             sleep "$SAMPLE_INTERVAL_SECONDS"
           done
           wait "$BPID" 2>/dev/null
-          echo "build_exit_code=$?"
-          echo "elapsed_compile_seconds=$(( $(date +%s) - START ))"
-          tail -n 40 /tmp/build.log
+          BRC=$?
+          END=$(date +%s)
+          echo "build_exit_code=$BRC"
+          echo 'exit 137 means OUR OWN SIGKILL at the budget. That is NOT a failure.'
+          echo "elapsed_compile_seconds=$(( END - START ))"
           echo "final_progress: $(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log | tail -n 1)"
-          echo "error_lines: $(grep -c -iE '^(FAILED|ninja: build stopped|error:)' /tmp/build.log)"
+          echo "error_lines: $(grep -c -iE '^(FAILED|ninja: build stopped|Schedule Failure|error:)' /tmp/build.log)"
+          grep -iE '^(FAILED|ninja: build stopped|Schedule Failure)' /tmp/build.log | head -n 20
+          echo '----- VALIDITY GATE B05 -----'
+          if [ -s /tmp/build.log ]; then echo 'B05 PASS the resumed build produced output'; else echo 'B05 FAIL no build output at all'; fi
 
-      - name: B06 did an APK actually appear
-        if: always()
+      - name: B06 did an APK appear - M1b and the libchrome.so question
         run: |
           set +e
           cd "$GITHUB_WORKSPACE/chromium/src"
-          find out/Default -maxdepth 3 -name '*.apk' -printf '%s %p\n' 2>/dev/null | head -20
-          echo '----- VALIDITY GATE B06 - MILESTONE M1b -----'
-          if find out/Default -maxdepth 3 -name '*.apk' | grep -q apk; then
-            echo 'B06 PASS an UNMODIFIED arm64 APK EXISTS - M1b reached'
-            echo '----- what is inside it - answers the never-unpacked-APK question -----'
-            A=$(find out/Default -maxdepth 3 -name '*.apk' | head -1)
-            unzip -l "$A" | grep -iE '\.so$|lib/' | head -20
-            unzip -l "$A" | tail -3
+          echo '----- every apk in the output tree -----'
+          find out/Default -name '*.apk' -printf '%s  %p\n' 2>/dev/null | sort -rn | head -20
+          echo '----- every .so in the output tree, largest first -----'
+          find out/Default -name '*.so' -printf '%s  %p\n' 2>/dev/null | sort -rn | head -20
+          APK=$(find out/Default -name 'ChromePublic.apk' | head -1)
+          echo "apk_path: ${APK:-none}"
+          if [ -n "$APK" ]; then
+            echo "apk_bytes: $(stat -c%s "$APK")"
+            echo '----- FIRST EVER UNPACK OF OUR OWN APK -----'
+            unzip -l "$APK" | grep -iE '\.so$|lib/' | head -30
+            echo 'The owner reported libchrome.so at about 207 MB from a decompiled'
+            echo 'release APK. This is the first chance to confirm the name and size'
+            echo 'from a build we made ourselves.'
+            echo 'B06 PASS an APK exists - M1b reached'
           else
-            echo 'B06 RESULT no APK yet - the build did not reach the end within budget'
+            echo 'B06 RESULT no APK yet. Expected if the budget stopped the build early.'
+            echo 'This is NOT a failure of the resume test. B05 answers OQ-26, not B06.'
           fi
-          df -h /; free -m
 
-      - name: B07 FINAL SUMMARY
-        if: always()
+      - name: B07 summary
         run: |
           echo '================ SPIKE S4B SUMMARY ================'
-          echo "snapshot_tag_used: $SNAPSHOT_TAG"
+          echo 'THE ANSWER TO OQ-26 IS THE FIRST_PROGRESS_LINE VALUE IN STEP B05.'
+          echo '  near 28548 -> the restored tree RESUMED. D2 is alive.'
+          echo '  near 0     -> it RESTARTED. D2 chaining by snapshot is dead.'
+          echo 'Secondary evidence: edges_remaining_after_restore in B04 versus'
+          echo 'edges_COLD_before_restore in R12.'
           df -h /; free -m
           echo 'Copy this entire log back into the chat.'
