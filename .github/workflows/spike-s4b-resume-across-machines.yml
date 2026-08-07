@@ -163,22 +163,39 @@ jobs:
           git config --global user.name spike
           git config --global --list | grep -E 'user\.(email|name)'
 
+      # v3 FIX - RULE 19 VIOLATION REPAIRED (see A28 defect D-S4B-01)
+      # v2 of this step was NOT the S4A step. It invented its own pruning and
+      # tried to copy a vanadium/titanium directory that does not exist in the
+      # pinned Vanadium tree (verified: 0 paths matching /titanium/ inside
+      # Vanadium-593cf8ce...zip). The real origin of src/titanium is the
+      # vanadium->titanium rename applied to the PATCH SERIES before git am.
+      # Skipping that rename meant the patches created vanadium/ paths, so
+      # src/titanium never existed, so the filter-list hook failed (exit 2),
+      # so gn gen failed, so the resumed build never started and OQ-26 got
+      # no answer. The block below is copied VERBATIM from S4A.
       - name: R07 pruning and rename (build.sh lines 18-28)
         run: |
           set +e
           cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
           S="$GITHUB_WORKSPACE"
-          cp "$S/.gclient" ../.gclient
+          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
+          rm -rf $S/vanadium/patches/*component-updates.patch
+          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
+          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
           t0=$(date +%s)
-          rm -rf third_party/blink/web_tests
-          rm -rf third_party/hunspell/dictionaries
-          rm -rf chrome/test/data
-          rm -rf content/test/data
-          export org new
-          replace() { export org=$2 new=$3; find $1 -type f -exec sed -i 's@'$org'@'$new'@g' {} \; ; }
+          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
           echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
-          cp -r "$S/vanadium/titanium" titanium 2>/dev/null || echo 'no titanium dir to copy - matches S4A behaviour'
-          ls -1 | head -20
+          echo '----- VALIDITY GATE R07 (new in v3, RULE 18 positive assertion) -----'
+          if grep -rlq 'titanium' "$S/vanadium/patches" 2>/dev/null; then
+            echo 'R07 PASS patch series renamed to titanium'
+          else
+            echo 'R07 FAIL rename did not take - src/titanium will not exist and every later step is void'
+          fi
 
       - name: R08 git am the pruned patch series
         run: |
@@ -211,6 +228,8 @@ jobs:
           gclient runhooks
           rc=$?
           echo "runhooks_exit_code=$rc"
+          echo 'v3 NOTE: S4A recorded runhooks_exit_code=0 and HOOK1 PASS.'
+          echo 'Any other value means the R07 rename did not take. Stop reading here.'
           echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
           cd src
           echo '----- VALIDITY GATE 1 (Rule 18): filter list -----'
