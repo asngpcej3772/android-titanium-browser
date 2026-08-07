@@ -1,0 +1,302 @@
+name: spike-s6-parallel-chunks
+
+# SPIKE S6 - THE PARALLELISM TEST. Four separate machines, four different
+# chunk targets, at the same time. This is the owner's core Session 019
+# proposal put in front of real compute.
+#
+# Answers:
+#   OQ-34c do independent chunks really build on separate machines
+#   OQ-39  how much of each chunk's cost is SETUP rather than compile - because
+#          every parallel machine pays the full setup toll again, and that toll
+#          is the hidden tax on the whole parallel idea
+#   plus a direct comparison of per-chunk edge counts against A23's totals
+#
+# HONEST LIMITATION, STATED BEFORE THE RUN, NOT AFTER:
+# Even if all four chunks succeed, this does NOT prove a split APK is possible.
+# Chromium's documented partition mechanism cuts at LINK time from the complete
+# object set (A25 section 9.2). Four chunk object sets on four dead machines
+# cannot be linked unless they are transported to one machine first - which is
+# S4A/S4B's question, not this one. S6 measures the COMPILE half only.
+#
+# RULE 19: R00-R12 reproduced VERBATIM from spike-s3-compilerate.yml.
+# RULE 8/18 gates. RULE 21 memory. DEC-024 no estimates. DEC-025/029/026 kept.
+
+on:
+  workflow_dispatch:
+    inputs:
+      chunk_budget_seconds:
+        description: seconds allowed per chunk
+        required: true
+        default: "7200"
+
+permissions:
+  contents: read
+
+jobs:
+  chunk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - "//v8:v8"
+          - "//third_party/blink/renderer/core:core"
+          - "//content/browser:browser"
+          - "//net:net"
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      CHUNK: ${{ matrix.target }}
+      COMPILE_BUDGET_SECONDS: ${{ inputs.chunk_budget_seconds }}
+      SAMPLE_INTERVAL_SECONDS: "300"
+
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: R00 baseline
+        run: |
+          echo "CHUNK=$CHUNK"
+          nproc; free -g; df -h /
+          git --version
+          echo "runner_os=$RUNNER_OS arch=$(uname -m)"
+          echo "setup_clock_start=$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: R01 version proof
+        run: |
+          git log -1 --format='%H %ci %s'
+          git -C vanadium log -1 --format='%H %ci'
+          grep -E 'android_default_version_(name|code)' vanadium/args.gn
+          echo "patches      : $(ls -1 vanadium/patches/*.patch | wc -l)"
+          echo "subprojects  : $(find vanadium/subprojects_patches -name '*.patch' | wc -l)"
+
+      - name: R02 inline disk reclamation
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -1; }
+          BEFORE=$(avail)
+          group() {
+            local label=$1; shift; local b=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              else
+                echo "  absent   $p"
+              fi
+            done
+            local a=$(avail)
+            echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
+          }
+          group G1-android /usr/local/lib/android
+          group G2-dotnet /usr/share/dotnet
+          group G3-haskell /opt/ghc /usr/local/.ghcup
+          group G4-swift /usr/share/swift
+          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
+                        /usr/local/share/chromium /usr/local/lib/node_modules \
+                        /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
+                        /usr/local/graalvm /opt/pipx
+          group G6-toolcache /opt/hostedtoolcache
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          b8=$(avail)
+          sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable powershell libgl1-mesa-dri >/dev/null 2>&1
+          sudo apt-get autoremove -y >/dev/null 2>&1
+          sudo apt-get clean >/dev/null 2>&1
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          echo "===== TOTAL INLINE RECLAIM: $(( ($(avail) - BEFORE) / 1024 )) MB ====="
+          df -h /
+
+      - name: R03 apt prerequisites
+        run: |
+          t0=$(date +%s)
+          sudo apt-get update
+          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libgcc-s1:i386
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R04 depot_tools
+        run: |
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R05 shallow single-tag Chromium fetch
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          t0=$(date +%s)
+          mkdir -p "$GITHUB_WORKSPACE/chromium/src/out/Default"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git init -q
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          git checkout -q "$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          du -sh . ; du -sh .git ; df -h /
+
+      - name: R06 GLOBAL git identity (DEC-032 - the proven fix)
+        run: |
+          git config --global user.email spike@example.invalid
+          git config --global user.name spike
+          git config --global --list | grep -E 'user\.(name|email)'
+          echo 'identity is global, so every subproject repo inherits it'
+
+      - name: R07 pruning and rename (build.sh lines 18-28)
+        run: |
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
+          S="$GITHUB_WORKSPACE"
+          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
+          rm -rf $S/vanadium/patches/*component-updates.patch
+          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
+          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          t0=$(date +%s)
+          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
+          echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R08 git am the pruned patch series
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          git am --whitespace=nowarn --keep-non-patch $GITHUB_WORKSPACE/vanadium/patches/*.patch > /tmp/am.log 2>&1
+          rc=$?
+          echo "elapsed_git_am_seconds=$(( $(date +%s) - t0 ))"
+          echo "git_am_exit_code=$rc"
+          echo "applying_lines: $(grep -c '^Applying: ' /tmp/am.log)"
+          if [ $rc -ne 0 ]; then tail -n 40 /tmp/am.log; fi
+
+      - name: R09 gclient sync --nohooks
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          t0=$(date +%s)
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: R10 gclient runhooks with the UNMODIFIED .gclient - tests DEC-032
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          echo 'hook2 present in .gclient:' $(grep -c apply_subprojects_patches "$GITHUB_WORKSPACE/chromium/.gclient")
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          gclient runhooks > /tmp/hooks.log 2>&1
+          echo "runhooks_exit_code=$?"
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          echo 'IndexError count (0 means DEC-032 held):' $(grep -c IndexError /tmp/hooks.log)
+          tail -n 20 /tmp/hooks.log
+          echo '----- VALIDITY GATE 1 -----'
+          if [ -s titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
+            echo "HOOK1 PASS filter list bytes: $(stat -c%s titanium/android_config/filter_lists/filter_lists_easylist.txt)"
+          else
+            echo 'HOOK1 FAIL'
+          fi
+          echo '----- VALIDITY GATE 2 -----'
+          if git -C v8 log --oneline -5 | grep -qi drumbrake; then
+            echo 'V8 SUBPROJECT PATCHES PRESENT via hook'
+          else
+            echo 'V8 SUBPROJECT PATCHES ABSENT - applying manually as fallback'
+            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/v8/*.patch; do
+              git -C v8 am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
+            done
+            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/third_party/search_engines_data/resources/*.patch; do
+              git -C third_party/search_engines_data/resources am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
+            done
+          fi
+          echo "clang present: $(ls -1 third_party/llvm-build/Release+Asserts/bin/clang 2>/dev/null || echo NO)"
+          df -h /
+
+      - name: R11 install-build-deps
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
+          df -h /
+
+      - name: R12 patch.sh then args.gn arm64 then gn gen
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          source "$GITHUB_WORKSPACE/common.sh" 2>/dev/null
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          source "$GITHUB_WORKSPACE/patch.sh" > /tmp/patch_sh.log 2>&1
+          echo "patch_sh_exit_code=$?"
+          cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
+          sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          t0=$(date +%s)
+          gn gen out/Default || echo 'GN GEN RETURNED NONZERO'
+          echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
+          echo "setup_total_seconds=$(( $(date +%s) - setup_clock_start ))" 2>/dev/null
+          echo "SETUP_END_EPOCH=$(date +%s)" >> "$GITHUB_ENV"
+          df -h /
+
+      - name: P01 SETUP TAX - the hidden cost every parallel machine repays
+        run: |
+          echo "chunk=$CHUNK"
+          echo "setup_clock_start=$setup_clock_start"
+          echo "setup_end_epoch=$SETUP_END_EPOCH"
+          echo "setup_total_seconds=$(( SETUP_END_EPOCH - setup_clock_start ))"
+          echo 'OQ-39: every one of the four machines paid this before compiling one edge.'
+
+      - name: P02 CHUNK COMPILE with memory sampling
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo "chunk_edges_planned: $(ninja -C out/Default -n "$CHUNK" 2>/dev/null | wc -l)"
+          START=$(date +%s)
+          nohup autoninja -C out/Default "$CHUNK" > /tmp/chunk.log 2>&1 &
+          BPID=$!
+          while kill -0 "$BPID" 2>/dev/null; do
+            NOW=$(date +%s); EL=$(( NOW - START ))
+            if [ "$EL" -ge "$COMPILE_BUDGET_SECONDS" ]; then
+              echo "BUDGET REACHED at ${EL}s"
+              kill -INT "$BPID" 2>/dev/null; sleep 20; kill -9 "$BPID" 2>/dev/null
+              break
+            fi
+            LASTP=$(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/chunk.log 2>/dev/null | tail -n 1)
+            MEM=$(free -m | awk '/^Mem:/{print "total="$2" used="$3" avail="$7}')
+            SWP=$(free -m | awk '/^Swap:/{print "swapused="$3}')
+            echo "SAMPLE chunk=$CHUNK elapsed=${EL}s progress=${LASTP:-none} load=$(cut -d' ' -f1-3 /proc/loadavg) free=$(df --output=avail -k / | tail -1) $MEM $SWP"
+            sleep "$SAMPLE_INTERVAL_SECONDS"
+          done
+          wait "$BPID" 2>/dev/null
+          echo "chunk_exit_code=$?"
+          echo "elapsed_chunk_seconds=$(( $(date +%s) - START ))"
+          tail -n 30 /tmp/chunk.log
+          echo "chunk_final_progress: $(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/chunk.log | tail -n 1)"
+          echo "chunk_error_lines: $(grep -c -iE '^(FAILED|ninja: build stopped|error:)' /tmp/chunk.log)"
+          echo '----- VALIDITY GATE P02 -----'
+          if grep -qiE '^(FAILED|ninja: build stopped)' /tmp/chunk.log; then echo "P02 FAIL chunk $CHUNK did not build cleanly"; else echo "P02 PASS chunk $CHUNK clean"; fi
+
+      - name: P03 what this chunk produced, and what it cost
+        if: always()
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo "chunk=$CHUNK"
+          echo "ninja_log_lines: $(wc -l < out/Default/.ninja_log 2>/dev/null || echo 0)"
+          echo "object_files: $(find out/Default/obj -name '*.o' 2>/dev/null | wc -l)"
+          echo "out_default_mb: $(du -sm out/Default 2>/dev/null | cut -f1)"
+          echo "any .so produced:"
+          find out/Default -maxdepth 2 -name '*.so' -printf '%s %p\n' 2>/dev/null | head -10
+          df -h /; free -m
+          echo 'Copy this entire log back into the chat, together with the other three chunk logs.'

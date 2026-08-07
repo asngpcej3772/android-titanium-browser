@@ -1,0 +1,385 @@
+name: spike-s5-graph
+
+# SPIKE S5 - READ-ONLY BUILD GRAPH INTERROGATION. COMPILES NOTHING.
+#
+# Answers, from OUR pinned tree rather than from web documentation:
+#   OQ-32  does the partition machinery exist in 150.0.7871.124
+#   OQ-33  is is_component_build permitted alongside is_official_build
+#   OQ-34  candidate group closure sizes and their OVERLAP (the decisive ratio)
+#   OQ-27  why the edge total moved 90,661 -> 78,597
+#   OQ-38  is chrome_public_bundle extra work over chrome_public_apk
+#   C-item did every patch.sh sed actually match (silent sed failure)
+#
+# RULE 19: stages R00-R12 are reproduced VERBATIM from spike-s3-compilerate.yml.
+# Do not "improve" them. Any deviation invalidates comparison with A23.
+# RULE 8/18: every gate prints an explicit PASS or FAIL token.
+# RULE 21: every sample loop captures memory.
+# DEC-024: this file estimates NO durations.
+# DEC-025: actions pinned by 40-char SHA. DEC-029: zero third-party actions.
+# DEC-026: nothing is deleted from the checkout to make numbers look better.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  graph:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      DEBIAN_FRONTEND: noninteractive
+
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: R00 baseline
+        run: |
+          nproc; free -g; df -h /
+          git --version
+          echo "runner_os=$RUNNER_OS arch=$(uname -m)"
+
+      - name: R01 version proof
+        run: |
+          git log -1 --format='%H %ci %s'
+          git -C vanadium log -1 --format='%H %ci'
+          grep -E 'android_default_version_(name|code)' vanadium/args.gn
+          echo "patches      : $(ls -1 vanadium/patches/*.patch | wc -l)"
+          echo "subprojects  : $(find vanadium/subprojects_patches -name '*.patch' | wc -l)"
+
+      - name: R02 inline disk reclamation
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -1; }
+          BEFORE=$(avail)
+          group() {
+            local label=$1; shift; local b=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              else
+                echo "  absent   $p"
+              fi
+            done
+            local a=$(avail)
+            echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
+          }
+          group G1-android /usr/local/lib/android
+          group G2-dotnet /usr/share/dotnet
+          group G3-haskell /opt/ghc /usr/local/.ghcup
+          group G4-swift /usr/share/swift
+          group G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az \
+                        /usr/local/share/chromium /usr/local/lib/node_modules \
+                        /usr/local/share/boost /opt/google /usr/lib/google-cloud-sdk \
+                        /usr/local/graalvm /opt/pipx
+          group G6-toolcache /opt/hostedtoolcache
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          b8=$(avail)
+          sudo apt-get purge -y firefox google-chrome-stable microsoft-edge-stable powershell libgl1-mesa-dri >/dev/null 2>&1
+          sudo apt-get autoremove -y >/dev/null 2>&1
+          sudo apt-get clean >/dev/null 2>&1
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          echo "===== TOTAL INLINE RECLAIM: $(( ($(avail) - BEFORE) / 1024 )) MB ====="
+          df -h /
+
+      - name: R03 apt prerequisites
+        run: |
+          t0=$(date +%s)
+          sudo apt-get update
+          sudo apt-get install -y sudo lsb-release file nano git curl python3 python3-pillow imagemagick librsvg2-bin
+          sudo dpkg --add-architecture i386
+          sudo apt-get update
+          sudo apt-get install -y libgcc-s1:i386
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R04 depot_tools
+        run: |
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R05 shallow single-tag Chromium fetch
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          t0=$(date +%s)
+          mkdir -p "$GITHUB_WORKSPACE/chromium/src/out/Default"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git init -q
+          git remote add origin https://chromium.googlesource.com/chromium/src.git
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          git checkout -q "$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          du -sh . ; du -sh .git ; df -h /
+
+      - name: R06 GLOBAL git identity (DEC-032 - the proven fix)
+        run: |
+          git config --global user.email spike@example.invalid
+          git config --global user.name spike
+          git config --global --list | grep -E 'user\.(name|email)'
+          echo 'identity is global, so every subproject repo inherits it'
+
+      - name: R07 pruning and rename (build.sh lines 18-28)
+        run: |
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
+          S="$GITHUB_WORKSPACE"
+          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
+          rm -rf $S/vanadium/patches/*component-updates.patch
+          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
+          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          t0=$(date +%s)
+          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
+          echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R08 git am the pruned patch series
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          git am --whitespace=nowarn --keep-non-patch $GITHUB_WORKSPACE/vanadium/patches/*.patch > /tmp/am.log 2>&1
+          rc=$?
+          echo "elapsed_git_am_seconds=$(( $(date +%s) - t0 ))"
+          echo "git_am_exit_code=$rc"
+          echo "applying_lines: $(grep -c '^Applying: ' /tmp/am.log)"
+          if [ $rc -ne 0 ]; then tail -n 40 /tmp/am.log; fi
+
+      - name: R09 gclient sync --nohooks
+        run: |
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          t0=$(date +%s)
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          gclient sync -D --no-history --nohooks || echo 'SYNC RETURNED NONZERO'
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: R10 gclient runhooks with the UNMODIFIED .gclient - tests DEC-032
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          echo 'hook2 present in .gclient:' $(grep -c apply_subprojects_patches "$GITHUB_WORKSPACE/chromium/.gclient")
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          gclient runhooks > /tmp/hooks.log 2>&1
+          rc=$?
+          echo "runhooks_exit_code=$rc"
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- IndexError present in hook output (0 means DEC-032 fixed it) -----'
+          grep -c IndexError /tmp/hooks.log
+          echo '----- subproject patch application lines -----'
+          grep -E 'Applied successfully|Skipping patch application|aborting previous' /tmp/hooks.log
+          echo '----- last 30 lines of hook output -----'
+          tail -n 30 /tmp/hooks.log
+          echo '----- VALIDITY GATE 1 (Rule 18): filter list -----'
+          if [ -s titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
+            echo "HOOK1 PASS filter list bytes: $(stat -c%s titanium/android_config/filter_lists/filter_lists_easylist.txt)"
+          else
+            echo 'HOOK1 FAIL'
+          fi
+          echo '----- VALIDITY GATE 2: are the v8 drumbrake patches in v8 history -----'
+          git -C v8 log --oneline -3
+          if git -C v8 log --oneline -5 | grep -qi drumbrake; then
+            echo 'V8 SUBPROJECT PATCHES PRESENT via hook'
+          else
+            echo 'V8 SUBPROJECT PATCHES ABSENT - applying manually as fallback'
+            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/v8/*.patch; do
+              git -C v8 am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
+            done
+            for p in "$GITHUB_WORKSPACE"/vanadium/subprojects_patches/third_party/search_engines_data/resources/*.patch; do
+              git -C third_party/search_engines_data/resources am --whitespace=nowarn --keep-non-patch "$p" 2>&1 | tail -n 3
+            done
+            git -C v8 log --oneline -3
+          fi
+          echo "clang present: $(ls -1 third_party/llvm-build/Release+Asserts/bin/clang 2>/dev/null || echo NO)"
+          du -sh "$GITHUB_WORKSPACE/chromium" ; df -h /
+
+      - name: R11 install-build-deps
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          ./build/install-build-deps.sh --no-prompt || echo 'INSTALL-BUILD-DEPS RETURNED NONZERO'
+          df -h /
+
+      - name: G00 PRE-PATCH baseline for sed verification
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          git status --porcelain | wc -l
+          echo 'pre_patch_dirty_files above (expect 0 or near 0)'
+          git rev-parse HEAD > /tmp/pre_patch_head.txt
+          cat /tmp/pre_patch_head.txt
+
+      - name: G01 patch.sh, then PER-SED VERIFICATION (silent sed failure hunt)
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          source "$GITHUB_WORKSPACE/common.sh" 2>/dev/null
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          t0=$(date +%s)
+          source "$GITHUB_WORKSPACE/patch.sh" > /tmp/patch_sh.log 2>&1
+          echo "patch_sh_exit_code=$?"
+          echo "elapsed_patch_sh_seconds=$(( $(date +%s) - t0 ))"
+          echo "patch_sh_log_lines: $(wc -l < /tmp/patch_sh.log)"
+          echo '----- HOW MANY sed COMMANDS DOES patch.sh CONTAIN -----'
+          grep -c 'sed ' "$GITHUB_WORKSPACE/patch.sh"
+          echo '----- FILES ACTUALLY MODIFIED BY patch.sh -----'
+          git status --porcelain > /tmp/patched_files.txt
+          echo "modified_file_count: $(wc -l < /tmp/patched_files.txt)"
+          cat /tmp/patched_files.txt
+          echo '----- VALIDITY GATE G01 (Rule 18) -----'
+          MOD=$(wc -l < /tmp/patched_files.txt)
+          if [ "$MOD" -gt 0 ]; then echo "G01 PASS patch.sh modified $MOD files"; else echo 'G01 FAIL patch.sh modified NOTHING - every sed silently missed'; fi
+
+      - name: G02 args.gn arm64 then gn gen (baseline graph)
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
+          sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          grep -n 'target_cpu\|is_component_build\|is_official_build' out/Default/args.gn
+          t0=$(date +%s)
+          gn gen out/Default > /tmp/gn_gen.log 2>&1
+          echo "gn_gen_exit_code=$?"
+          echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
+          tail -n 5 /tmp/gn_gen.log
+          echo '----- VALIDITY GATE G02 -----'
+          if [ -f out/Default/build.ninja ]; then echo 'G02 PASS build.ninja exists'; else echo 'G02 FAIL no build.ninja - every later number is void'; fi
+          free -m
+
+      - name: G03 EDGE COUNTS - OQ-27 and OQ-38
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo "edges_chrome_public_apk    : $(ninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
+          echo "edges_chrome_public_bundle : $(ninja -C out/Default -n chrome_public_bundle 2>/dev/null | wc -l)"
+          echo "edges_both_targets         : $(ninja -C out/Default -n chrome_public_apk chrome_public_bundle 2>/dev/null | wc -l)"
+          echo '----- gn target totals for comparison with A23 (88,706 / 677,586) -----'
+          grep -iE 'Made .* targets' /tmp/gn_gen.log
+          echo "ninja_all_targets: $(ninja -C out/Default -t targets all 2>/dev/null | wc -l)"
+
+      - name: G04 OQ-32 IN-TREE - does the partition machinery exist here
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo '----- partition template files -----'
+          ls -l build/config/android/extract_unwind_tables.gni 2>/dev/null | head -1
+          find build -name '*partition*' -o -name '*partitioned*' | head -20
+          echo '----- symbol references across the whole tree -----'
+          echo "partitioned_shared_library : $(grep -rl 'partitioned_shared_library' --include='*.gn' --include='*.gni' . 2>/dev/null | wc -l) files"
+          echo "native_library_partition   : $(grep -rl 'native_library_partition' --include='*.gn' --include='*.gni' . 2>/dev/null | wc -l) files"
+          echo "partition_alloc excluded from the two counts above by name match only"
+          echo '----- the files themselves -----'
+          grep -rl 'partitioned_shared_library\|native_library_partition' --include='*.gn' --include='*.gni' . 2>/dev/null | head -20
+          echo '----- the doc, if it shipped in the tarball -----'
+          if [ -f docs/android_native_libraries.md ]; then
+            echo 'DOC PRESENT - printing the Partitioned libraries section'
+            sed -n '/[Pp]artitioned libraries/,/^## /p' docs/android_native_libraries.md | head -60
+          else
+            echo 'DOC ABSENT in this checkout'
+          fi
+          echo '----- VALIDITY GATE G04 -----'
+          N=$(grep -rl 'partitioned_shared_library\|native_library_partition' --include='*.gn' --include='*.gni' . 2>/dev/null | wc -l)
+          if [ "$N" -gt 0 ]; then echo "G04 PASS partition machinery EXISTS in our pinned tree ($N gn files)"; else echo 'G04 RESULT partition machinery ABSENT in our pinned tree - OQ-32 answered NO'; fi
+
+      - name: G05 OQ-33 - is_component_build alongside is_official_build
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          mkdir -p out/Comp
+          cp out/Default/args.gn out/Comp/args.gn
+          echo 'is_component_build = true' >> out/Comp/args.gn
+          t0=$(date +%s)
+          gn gen out/Comp > /tmp/gn_comp.log 2>&1
+          RC=$?
+          echo "gn_gen_component_exit_code=$RC"
+          echo "elapsed_gn_component_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- full gn output for the component attempt -----'
+          cat /tmp/gn_comp.log
+          echo '----- VALIDITY GATE G05 - THIS IS THE OQ-33 ANSWER -----'
+          if [ $RC -eq 0 ]; then
+            echo 'G05 RESULT component build ACCEPTED by gn alongside is_official_build'
+            echo "edges_component_apk: $(ninja -C out/Comp -n chrome_public_apk 2>/dev/null | wc -l)"
+            echo "shared_library_outputs: $(ninja -C out/Comp -t targets all 2>/dev/null | grep -c '\.so')"
+          else
+            echo 'G05 RESULT component build REJECTED - OQ-33 answered NO, and the reason is in the log above'
+          fi
+          rm -rf out/Comp
+
+      - name: G06 OQ-34 THE DECISIVE RATIO - closure sizes and overlap
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          for T in chrome_public_apk //v8:v8 //third_party/blink/renderer/core:core //content/browser:browser //base:base //net:net //media:media; do
+            N=$(ninja -C out/Default -n "$T" 2>/dev/null | wc -l)
+            echo "closure_edges $T = $N"
+          done
+          echo '----- OVERLAP: edges shared between candidate groups -----'
+          ninja -C out/Default -n //v8:v8 2>/dev/null | sort -u > /tmp/c_v8.txt
+          ninja -C out/Default -n //base:base 2>/dev/null | sort -u > /tmp/c_base.txt
+          ninja -C out/Default -n //net:net 2>/dev/null | sort -u > /tmp/c_net.txt
+          ninja -C out/Default -n //media:media 2>/dev/null | sort -u > /tmp/c_media.txt
+          for a in v8 net media; do
+            echo "overlap_${a}_with_base: $(comm -12 /tmp/c_$a.txt /tmp/c_base.txt | wc -l) of $(wc -l < /tmp/c_$a.txt)"
+          done
+          echo "overlap_v8_with_net: $(comm -12 /tmp/c_v8.txt /tmp/c_net.txt | wc -l)"
+          echo "union_v8_net_media_base: $(cat /tmp/c_v8.txt /tmp/c_net.txt /tmp/c_media.txt /tmp/c_base.txt | sort -u | wc -l)"
+          echo 'INTERPRETATION NOTE: if union is close to the sum, the groups are separable.'
+          echo 'If union is close to the largest single closure, they are not - they share almost everything.'
+          free -m
+
+      - name: G07 gn analyze - which targets do OUR patches actually affect
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          python3 -c "import json;fs=[l[3:].strip() for l in open('/tmp/patched_files.txt') if l.strip()];fs=['//'+f for f in fs];json.dump({'files':fs,'test_targets':[],'additional_compile_targets':['chrome_public_apk']},open('/tmp/analyze_in.json','w'));print('files_submitted:',len(fs))"
+          gn analyze out/Default /tmp/analyze_in.json /tmp/analyze_out.json > /tmp/analyze.log 2>&1
+          echo "gn_analyze_exit_code=$?"
+          tail -n 5 /tmp/analyze.log
+          echo '----- analyze result -----'
+          cat /tmp/analyze_out.json
+          echo '----- VALIDITY GATE G07 -----'
+          if [ -s /tmp/analyze_out.json ]; then echo 'G07 PASS gn analyze produced a result'; else echo 'G07 FAIL gn analyze produced nothing'; fi
+
+      - name: G08 gn refs - commonality of the files we touch
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          head -20 /tmp/patched_files.txt | while read -r st f; do
+            [ -z "$f" ] && continue
+            echo "--- refs for //$f ---"
+            gn refs out/Default "//$f" 2>/dev/null | head -10
+            echo "    ref_target_count: $(gn refs out/Default "//$f" 2>/dev/null | wc -l)"
+          done
+
+      - name: G09 FINAL SUMMARY
+        if: always()
+        run: |
+          echo '================ SPIKE S5 SUMMARY ================'
+          echo 'Gates: G01 sed, G02 gn gen, G04 partition machinery, G05 component build, G07 analyze'
+          grep -h 'PASS\|FAIL\|RESULT' /dev/null 2>/dev/null
+          df -h /; free -m
+          echo 'NOTHING WAS COMPILED IN THIS RUN BY DESIGN.'
+          echo 'Copy this entire log back into the chat.'
