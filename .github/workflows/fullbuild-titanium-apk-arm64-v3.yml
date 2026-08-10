@@ -1,0 +1,926 @@
+# W9 - FULL BUILD v3. THE RESUME VERDICT RUN.
+#
+# Session 030. Successor to fullbuild-titanium-apk-arm64-v2.yml (W8, never
+# dispatched) and to W7 (run 31351367933, cancelled by GitHub at 21,612.414 s
+# = 6.0034 h at [34735/78313] = 44.3541 % of a COLD build).
+#
+# THE ONE QUESTION THIS FILE EXISTS TO ANSWER, WITH A YES OR A NO
+#
+#   OQ-26: when out/Default is restored from a previous machine, does the build
+#   tool REUSE the restored objects, or does it recompile them?
+#
+# Every previous attempt answered NOT MEASURED because every previous attempt
+# used an instrument this project had already condemned in writing:
+#   S4A  edges_remaining_after_pause: 0   - plain ninja REFUSED to run at all
+#        ("out/Default contains Siso state file"), so 0 was the line count of
+#        an empty file, not an enumeration. A tool failure shaped like success.
+#   S4Bv3 edges_remaining_after_restore: 21 - 21 lines is a manifest
+#        regeneration transcript, not an enumeration (T-14, RULE 43).
+#   S4Bv4 first_VALID_progress_line: [0/95939] - a FIRST progress line compared
+#        against a FINAL one. Not a comparison at all (RULE 38).
+#   W7   ran cold by owner choice, so it never tested resume.
+#
+# THIS FILE DOES NOT USE ANY OF THOSE INSTRUMENTS AS EVIDENCE. It still prints
+# them, because they are cheap and they are part of the record, but the verdict
+# is computed from ONE reading that cannot be faked in either direction:
+#
+#   THE OLDEST-OBJECT MTIME PANEL.
+#   Before the build starts we stat the 400 OLDEST .o files in the restored
+#   tree and write their mtimes to disk. The build then runs for a long,
+#   bounded observation window. Afterwards we stat the same 400 files again.
+#     - mtime UNCHANGED  = that object was not rewritten = it was REUSED.
+#     - mtime CHANGED or file MISSING = it was recompiled.
+#   The oldest objects are the ones a from-scratch build reaches FIRST, so after
+#   a long window a zero-recompile reading is informative in a way that S4B v4's
+#   180-second zero never was (RULE 42 - an instrument must be shown to have
+#   POWER before its output is admissible).
+#
+#   THE VERDICT IS PRINTED FROM INSIDE THE SAMPLER LOOP at verdict_at_seconds,
+#   long before the 6-hour wall, and AGAIN from an if: always() post-mortem
+#   step. It therefore survives cancellation. W7's readings all sat behind
+#   wait "$BPID" and printed nothing in exactly the case they were written for
+#   (D-W7-05). That cannot happen here.
+#
+# WHAT CHANGED SINCE W8, AND WHY - EACH ONE TRACEABLE TO A MEASUREMENT
+#
+# C7  THE TREE-WIDE TOUCH IS GONE FROM THE DEFAULT PATH. W7/W8 F01 ran
+#     "find out/Default -exec touch {} +" after gn gen. I wrote that for NINJA
+#     timestamp semantics. We do not build with ninja: args.gn line 22 is
+#     use_siso = true. Chromium's docs/siso_tips.md documents a flag whose
+#     entire purpose is "Siso ignores local modified output files? ...
+#     --fs_keep_tainted will keep modified output files", i.e. Siso actively
+#     DISTRUSTS outputs that look locally modified - and touching 139,927 files
+#     is the most efficient possible way to make every restored object look
+#     locally modified at once. That is a HYPOTHESIS (OQ-60), not a proven
+#     cause, so this file does not merely delete the touch: it turns it into a
+#     selectable arm so the hypothesis can be TESTED rather than assumed.
+#       treatment: none   (DEFAULT) - restore and build. No gn gen, no touch.
+#       treatment: gngen  - restore, gn gen, build. No touch.
+#       treatment: touch  - restore, gn gen, tree-wide touch, build. This is
+#                           exactly what W7/W8 would have done, kept so the
+#                           suspected defect can be reproduced deliberately.
+#     Run treatment: none FIRST. One variable at a time.
+#
+# C8  EVERY COUNT IS PRINTED BESIDE THE EXIT CODE OF THE TOOL THAT PRODUCED IT.
+#     NEW RULE 46, earned by S4A: a count taken from a tool that refused to run
+#     is not a low number, it is NO number, and the two are indistinguishable
+#     unless the exit code is on the line next to it.
+#
+# C9  --clobber IS BANNED FROM THE BUILD COMMAND. siso_tips.md describes it as
+#     "Rerun steps even if outputs seems to be up-to-date". Passing it would
+#     silently destroy the experiment while appearing to work. The audit that
+#     ships this file greps for it. (It remains present on gh release upload,
+#     where it is an unrelated flag meaning overwrite-asset.)
+#
+# C10 THE BUILD TOOL IS INTERROGATED, NOT GUESSED. B00 already dumps the real
+#     siso/autoninja help. F01 now greps that dump for the exact flag names
+#     before anything is passed, and extra_build_flags defaults to EMPTY so the
+#     first run of this file changes exactly one thing.
+#
+# C11 NOTHING COMPILED IS EVER LOST AGAIN. There are now TWO non-killing
+#     checkpoints: one at checkpoint_at_seconds and a second at
+#     final_checkpoint_at_seconds, set at 5 h 40 m, i.e. before the 6.0034 h
+#     wall this project MEASURED. Each suspends the process tree with SIGSTOP,
+#     packs out/Default, uploads it to a draft release, and resumes it with
+#     SIGCONT. SIGSTOP is not a kill. There is still no timeout and no kill
+#     anywhere in this file, honouring the owner's instruction, while W7's loss
+#     of 5 h 39 m of compiled objects cannot recur.
+#
+# C12 WORK IS NOT REPEATED ON A WARM START. When use_snapshot is yes the cold
+#     enumeration in R12 is skipped by its own guard, F01 performs no gn gen
+#     and no touch, and out/Default is taken from the snapshot rather than
+#     rebuilt. The only setup that still runs is the part that MUST: the source
+#     tree itself, which the build cannot reference if it is absent.
+#
+# WHAT THIS FILE STILL CANNOT PROMISE, STATED PLAINLY (RULE 44)
+#   It will return a definitive YES or NO on OBJECT REUSE. It cannot promise a
+#   finished APK inside one 6-hour job, because whether a warm tree finishes in
+#   the remaining time is precisely the quantity being measured. If reuse is
+#   YES, the APK may well land in this same run and F03/F04 will publish it. If
+#   reuse is YES but time runs out, the checkpoint carries the work forward and
+#   the next run starts from further along. If reuse is NO, we will know that
+#   for certain, with the arm that caused it named.
+#
+# NO PRODUCTION CODE IS INVENTED HERE. The multi-profile patch still does not
+# exist, so this builds the UNMODIFIED BASELINE, milestone M1b. Lines 94-361 of
+# W8 (Checkout through B02) and lines 521-609 (F03 through F05) are reproduced
+# BY FILE COPY and proven identical by diff, never retyped (RULE 19, RULE 26,
+# D-S4B-01).
+
+name: fullbuild-titanium-apk-arm64-v3
+
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_tag:
+        description: 'Authoritative snapshot tag to warm-start from'
+        required: true
+        default: 's4a-snapshot-31177312135'
+      use_snapshot:
+        description: 'yes = warm start from the snapshot, no = full cold build'
+        required: true
+        default: 'yes'
+      treatment:
+        description: 'none = no gn gen no touch (RUN THIS FIRST), gngen = gn gen only, touch = gn gen plus tree-wide touch'
+        required: true
+        default: 'none'
+      release_tag:
+        description: 'Tag for the published APK release'
+        required: true
+        default: 'titanium-baseline-arm64-001'
+      verdict_at_seconds:
+        description: 'Seconds into the build at which the OQ-26 verdict is computed and printed'
+        required: true
+        default: '2700'
+      checkpoint_at_seconds:
+        description: 'First non-killing checkpoint, seconds into the build'
+        required: true
+        default: '10800'
+      final_checkpoint_at_seconds:
+        description: 'Second non-killing checkpoint, seconds into the build. 20400 = 5h40m, before the measured 6.0034h wall'
+        required: true
+        default: '20400'
+      extra_build_flags:
+        description: 'Extra flags appended to the build command. LEAVE EMPTY on the first run - one variable at a time'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  fullbuild:
+    runs-on: ubuntu-latest
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      SNAPSHOT_TAG: ${{ github.event.inputs.snapshot_tag }}
+      USE_SNAPSHOT: ${{ github.event.inputs.use_snapshot }}
+      TREATMENT: ${{ github.event.inputs.treatment }}
+      RELEASE_TAG: ${{ github.event.inputs.release_tag }}
+      VERDICT_AT_SECONDS: ${{ github.event.inputs.verdict_at_seconds }}
+      CHECKPOINT_AT_SECONDS: ${{ github.event.inputs.checkpoint_at_seconds }}
+      FINAL_CHECKPOINT_AT_SECONDS: ${{ github.event.inputs.final_checkpoint_at_seconds }}
+      EXTRA_BUILD_FLAGS: ${{ github.event.inputs.extra_build_flags }}
+      SAMPLE_INTERVAL_SECONDS: '300'
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout fork with vanadium submodule
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a
+        with:
+          submodules: true
+          fetch-depth: 1
+
+      - name: R00 baseline and PATH IDENTITY CHECK
+        run: |
+          set +e
+          nproc; free -g; df -h /
+          echo "runner_os=$RUNNER_OS arch=$(uname -m)"
+          echo "workspace_path=$GITHUB_WORKSPACE"
+          echo 'PATH IDENTITY: S4A packed from'
+          echo '  /home/runner/work/android-titanium-browser/android-titanium-browser/chromium/src'
+          echo 'If workspace_path differs, absolute paths baked into the build'
+          echo 'may not match and that alone can force a rebuild. Risk R2.'
+
+      - name: R01 version proof
+        run: |
+          set +e
+          git log -1 --format='%H %ci %s'
+          git -C vanadium log -1 --format='%H %ci'
+          grep -n 'android_default_version_name\|android_default_version_code' vanadium/args.gn
+
+      - name: R02 inline disk reclamation
+        run: |
+          set +e
+          avail() { df --output=avail -k / | tail -1; }
+          BEFORE=$(avail)
+          drop() {
+            local label=$1; shift; local b=$(avail)
+            for p in "$@"; do
+              if [ -e "$p" ]; then
+                sz=$(du -sm "$p" 2>/dev/null | cut -f1)
+                echo "  removing $p (${sz} MB)"
+                sudo rm -rf "$p"
+              fi
+            done
+            local a=$(avail)
+            echo "GROUP $label reclaimed $(( (a - b) / 1024 )) MB"
+          }
+          drop G1-android /usr/local/lib/android
+          drop G2-dotnet /usr/share/dotnet
+          drop G3-haskell /usr/local/.ghcup
+          drop G4-swift /usr/share/swift
+          drop G5-misc /usr/local/share/powershell /usr/share/miniconda /opt/az /usr/local/share/chromium /usr/local/lib/node_modules /opt/google /usr/lib/google-cloud-sdk /opt/pipx
+          drop G6-toolcache /opt/hostedtoolcache
+          b7=$(avail); sudo docker system prune -af --volumes >/dev/null 2>&1; a7=$(avail)
+          echo "GROUP G7-docker reclaimed $(( (a7 - b7) / 1024 )) MB"
+          b8=$(avail)
+          sudo apt-get clean >/dev/null 2>&1
+          a8=$(avail)
+          echo "GROUP G8-apt reclaimed $(( (a8 - b8) / 1024 )) MB"
+          echo "===== TOTAL INLINE RECLAIM: $(( ($(avail) - BEFORE) / 1024 )) MB ====="
+          df -h /
+
+      - name: R03 apt prerequisites
+        run: |
+          set +e
+          t0=$(date +%s)
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq zstd python3 curl git
+          echo "elapsed_apt_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R04 depot_tools
+        run: |
+          set +e
+          t0=$(date +%s)
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$GITHUB_WORKSPACE/depot_tools"
+          echo "elapsed_depot_tools_seconds=$(( $(date +%s) - t0 ))"
+
+      - name: R05 shallow single-tag Chromium fetch
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          VERSION=$(grep -m1 -o '[0-9]\+\(\.[0-9]\+\)\{3\}' "$GITHUB_WORKSPACE/vanadium/args.gn")
+          echo "VERSION=$VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          mkdir -p "$GITHUB_WORKSPACE/chromium"
+          cd "$GITHUB_WORKSPACE/chromium"
+          git init -q
+          t0=$(date +%s)
+          git fetch --depth 1 https://chromium.googlesource.com/chromium/src.git "+refs/tags/$VERSION:chromium_$VERSION"
+          echo "elapsed_fetch_seconds=$(( $(date +%s) - t0 ))"
+          git checkout -q -f "chromium_$VERSION"
+          mkdir -p src
+          shopt -s dotglob
+          for f in *; do [ "$f" = src ] || mv "$f" src/ 2>/dev/null; done
+          shopt -u dotglob
+          ls -1 src | head -20
+
+      - name: R06 GLOBAL git identity (DEC-032 - the proven fix)
+        run: |
+          git config --global user.email spike@example.invalid
+          git config --global user.name spike
+          git config --global --list | grep -E 'user\.(email|name)'
+
+      # v3 FIX - RULE 19 VIOLATION REPAIRED (see A28 defect D-S4B-01)
+      # v2 of this step was NOT the S4A step. It invented its own pruning and
+      # tried to copy a vanadium/titanium directory that does not exist in the
+      # pinned Vanadium tree (verified: 0 paths matching /titanium/ inside
+      # Vanadium-593cf8ce...zip). The real origin of src/titanium is the
+      # vanadium->titanium rename applied to the PATCH SERIES before git am.
+      # Skipping that rename meant the patches created vanadium/ paths, so
+      # src/titanium never existed, so the filter-list hook failed (exit 2),
+      # so gn gen failed, so the resumed build never started and OQ-26 got
+      # no answer. The block below is copied VERBATIM from S4A.
+      - name: R07 pruning and rename (build.sh lines 18-28)
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          cp "$GITHUB_WORKSPACE/.gclient" ../.gclient
+          S="$GITHUB_WORKSPACE"
+          echo "patches before pruning : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          rm -rf $S/vanadium/patches/*trichrome-{apk-build-targets,browser-apk-targets}.patch
+          rm -rf $S/vanadium/patches/*{detailed,supported}-language*.patch
+          rm -rf $S/vanadium/patches/*component-updates.patch
+          rm -rf $S/vanadium/patches/*{pdf,PDF,for-content-public,toolbar-button}*.patch
+          echo "patches after pruning  : $(ls -1 $S/vanadium/patches/*.patch | wc -l)"
+          t0=$(date +%s)
+          find "$S/vanadium/patches" -type f -exec sed -i 's@VANADIUM@TITANIUM@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@Vanadium@Titanium@g' {} \;
+          find "$S/vanadium/patches" -type f -exec sed -i 's@vanadium@titanium@g' {} \;
+          echo "elapsed_replace_seconds=$(( $(date +%s) - t0 ))"
+          echo '----- VALIDITY GATE R07 (new in v3, RULE 18 positive assertion) -----'
+          if grep -rlq 'titanium' "$S/vanadium/patches" 2>/dev/null; then
+            echo 'R07 PASS patch series renamed to titanium'
+          else
+            echo 'R07 FAIL rename did not take - src/titanium will not exist and every later step is void'
+          fi
+
+      - name: R08 git am the pruned patch series
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          t0=$(date +%s)
+          git am --whitespace=nowarn --keep-non-patch $GITHUB_WORKSPACE/vanadium/patches/*.patch > /tmp/am.log 2>&1
+          rc=$?
+          echo "elapsed_git_am_seconds=$(( $(date +%s) - t0 ))"
+          echo "git_am_exit_code=$rc"
+          tail -n 10 /tmp/am.log
+
+      - name: R09 gclient sync --nohooks
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium"
+          t0=$(date +%s)
+          gclient sync -D --no-history --nohooks > /tmp/sync.log 2>&1
+          echo "sync_exit_code=$?"
+          echo "elapsed_sync_seconds=$(( $(date +%s) - t0 ))"
+          tail -n 10 /tmp/sync.log
+
+      - name: R10 gclient runhooks
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium"
+          t0=$(date +%s)
+          gclient runhooks
+          rc=$?
+          echo "runhooks_exit_code=$rc"
+          echo 'v3 NOTE: S4A recorded runhooks_exit_code=0 and HOOK1 PASS.'
+          echo 'Any other value means the R07 rename did not take. Stop reading here.'
+          echo "elapsed_runhooks_seconds=$(( $(date +%s) - t0 ))"
+          cd src
+          echo '----- VALIDITY GATE 1 (Rule 18): filter list -----'
+          if [ -f titanium/android_config/filter_lists/filter_lists_easylist.txt ]; then
+            echo "HOOK1 PASS filter list bytes: $(stat -c%s titanium/android_config/filter_lists/filter_lists_easylist.txt)"
+          else
+            echo 'HOOK1 FAIL'
+          fi
+
+      - name: R11 install-build-deps
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          sudo ./build/install-build-deps.sh --no-prompt --android > /tmp/deps.log 2>&1
+          echo "install_build_deps_exit_code=$?"
+          tail -n 5 /tmp/deps.log
+
+      - name: R12 patch.sh, args.gn arm64, gn gen, and THE COLD CONTROL NUMBER
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          source "$GITHUB_WORKSPACE/common.sh" 2>/dev/null
+          export SCRIPT_DIR="$GITHUB_WORKSPACE"
+          t0=$(date +%s)
+          source "$GITHUB_WORKSPACE/patch.sh" > /tmp/patch_sh.log 2>&1
+          echo "patch_sh_exit_code=$?"
+          echo "elapsed_patch_sh_seconds=$(( $(date +%s) - t0 ))"
+          mkdir -p out/Default
+          cp "$GITHUB_WORKSPACE/args.gn" out/Default/args.gn
+          sed -i 's/target_cpu = "arm"/target_cpu = "arm64"/' out/Default/args.gn
+          grep -n 'target_cpu\|is_component_build\|is_official_build\|use_siso' out/Default/args.gn
+          t0=$(date +%s)
+          gn gen out/Default > /tmp/gn_gen.log 2>&1
+          echo "gn_gen_exit_code=$?"
+          echo "elapsed_gn_seconds=$(( $(date +%s) - t0 ))"
+          tail -n 3 /tmp/gn_gen.log
+          echo '----- THE COLD CONTROL NUMBER - taken BEFORE siso ever runs -----'
+          echo 'This is what a FROM-SCRATCH tree wants to do. S5 measured 62798.'
+          echo "edges_COLD_before_restore: $(autoninja -C out/Default -n chrome_public_apk 2>/dev/null | wc -l)"
+
+      - name: B00 INTERROGATE THE BUILD TOOL - do not guess its flags
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo '----- which tools exist -----'
+          which autoninja ninja siso 2>&1
+          echo '----- autoninja help -----'
+          autoninja -h 2>&1 | head -40
+          echo '----- siso help, if siso is on PATH -----'
+          siso --help 2>&1 | head -40
+          echo '----- siso ninja help -----'
+          siso ninja --help 2>&1 | head -60
+          echo 'READ THIS OUTPUT. It tells us the real dry-run and explain flags.'
+          echo 'v1 guessed ninja flags for a siso build and voided its own data.'
+
+      - name: B01 download the S4A snapshot - with a draft fallback
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p snap
+          cd snap
+          echo "requested_tag=$SNAPSHOT_TAG"
+          echo '----- attempt 1: resolve by tag -----'
+          gh release download "$SNAPSHOT_TAG" --pattern 'part.*' --pattern '*.sha256' 2>&1 | tail -n 5
+          RC1=$?
+          echo "download_by_tag_exit_code=$RC1"
+          if [ ! -f part.000 ]; then
+            echo '----- attempt 1 produced nothing. Listing all releases including drafts -----'
+            gh release list --limit 30 2>&1 | head -30
+            echo '----- attempt 2: resolve the draft by its API tag_name -----'
+            REAL=$(gh api repos/${GITHUB_REPOSITORY}/releases --jq ".[] | select(.tag_name==\"$SNAPSHOT_TAG\") | .id" 2>/dev/null | head -1)
+            echo "draft_release_id=${REAL:-none}"
+            if [ -n "$REAL" ]; then
+              for A in $(gh api repos/${GITHUB_REPOSITORY}/releases/$REAL/assets --jq '.[].id' 2>/dev/null); do
+                NAME=$(gh api repos/${GITHUB_REPOSITORY}/releases/$REAL/assets/$A --jq '.name' 2>/dev/null)
+                echo "fetching asset $NAME"
+                gh api -H 'Accept: application/octet-stream' repos/${GITHUB_REPOSITORY}/releases/assets/$A > "$NAME" 2>/dev/null
+              done
+            fi
+          fi
+          ls -l
+          echo '----- VALIDITY GATE B01 -----'
+          if [ -f part.000 ]; then echo 'B01 PASS snapshot parts downloaded'; else echo 'B01 FAIL could not retrieve the draft release - everything downstream is void'; fi
+
+      - name: B02 reassemble and verify the payload byte for byte
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/snap"
+          cat part.* > outdefault.tar.zst 2>/dev/null
+          echo "reassembled_bytes: $(stat -c%s outdefault.tar.zst 2>/dev/null || echo 0)"
+          echo 'S4A recorded 1466004792 bytes and sha256'
+          echo '  5a532604c351cd62178430d0f441fab4d6d59d66ce1f42c34a5d976537319e0e'
+          ACT=$(sha256sum outdefault.tar.zst | cut -d' ' -f1)
+          echo "actual_sha256: $ACT"
+          echo '----- VALIDITY GATE B02 -----'
+          if [ "$ACT" = '5a532604c351cd62178430d0f441fab4d6d59d66ce1f42c34a5d976537319e0e' ]; then
+            echo 'B02 PASS payload is byte-identical to what S4A packed'
+          else
+            echo 'B02 FAIL payload differs - a resume result would be meaningless'
+          fi
+
+      - name: F00 RESTORE THE AUTHORITATIVE SNAPSHOT - mtimes preserved, nothing touched
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo "use_snapshot=$USE_SNAPSHOT"
+          echo "treatment=$TREATMENT"
+          if [ "$USE_SNAPSHOT" != yes ]; then echo 'F00 SKIPPED - cold build requested, out/Default from R12 is kept'; exit 0; fi
+          rm -rf out/Default
+          echo "rm_exit_code=$?"
+          T0=$(date +%s)
+          tar -I zstd -xf "$GITHUB_WORKSPACE/snap/outdefault.tar.zst"
+          echo "untar_exit_code=$?"
+          echo "untar_seconds=$(( $(date +%s) - T0 ))"
+          echo 'NOTE: tar restores stored mtimes by default and --touch is deliberately NOT'
+          echo 'used. The restored timestamps below should be Aug 2026 snapshot times, NOT'
+          echo 'the current time. If they equal now, the restore itself destroyed the'
+          echo 'evidence and every downstream reading is VOID.'
+          echo "now_epoch: $(date +%s)"
+          MB=$(du -sm out/Default 2>/dev/null | cut -f1)
+          echo "du_exit_code=$?"
+          NF=$(find out/Default -type f | grep -c '')
+          echo "find_exit_code=$?"
+          echo "restored_mb: $MB"
+          echo "restored_files: $NF"
+          NLL=$(grep -c '' out/Default/.ninja_log 2>/dev/null)
+          echo "ninja_log_lines: ${NLL:-0}  (exit $?)"
+          echo "siso_state_present: $(ls -1 out/Default/.siso_fs_state out/Default/.siso_deps 2>/dev/null | grep -c '')"
+          ls -l out/Default/.siso_fs_state out/Default/.siso_deps out/Default/.ninja_log out/Default/build.ninja 2>&1
+          echo '----- VALIDITY GATE F00 - asserts the POSITIVE on TWO independent readings -----'
+          echo 'S4A packed 9490 MB and 139927 files. A restore materially below that is not a restore.'
+          if [ "${MB:-0}" -ge 9000 ] && [ "${NF:-0}" -ge 139000 ]; then
+            echo 'F00 PASS tree restored at S4A scale'
+          else
+            echo "F00 FAIL restored_mb=$MB restored_files=$NF - below S4A scale, everything downstream is VOID"
+          fi
+
+      - name: F01 TREATMENT ARM AND THE BASELINE PANEL - the instrument that decides OQ-26
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          if [ "$USE_SNAPSHOT" != yes ]; then echo 'F01 SKIPPED - nothing was restored'; exit 0; fi
+          echo '----- args.gn as restored, before anything touches it -----'
+          grep -nE 'target_cpu|is_component_build|is_official_build|use_siso' out/Default/args.gn
+          echo "grep_exit_code=$?"
+          echo '================ INTERROGATE THE BUILD TOOL - DO NOT GUESS ITS FLAGS ================'
+          echo "which_autoninja: $(command -v autoninja)"
+          echo "which_siso: $(command -v siso)"
+          siso ninja --help > /tmp/sisohelp.txt 2>&1
+          echo "siso_help_exit_code=$?"
+          echo "siso_help_lines: $(grep -c '' /tmp/sisohelp.txt)"
+          echo '----- do the flags we have READ ABOUT actually exist in THIS binary? -----'
+          grep -nE 'fs_keep_tainted|clobber|offline|explain|verbose_failures' /tmp/sisohelp.txt
+          echo "flag_grep_exit_code=$?   (1 means NONE of them are present - then we pass none of them)"
+          echo 'C10: extra_build_flags defaults to EMPTY. Nothing above is passed to the build'
+          echo 'on this run. It is printed so the NEXT run can be designed from a reading'
+          echo 'instead of from a document.'
+          echo "extra_build_flags_as_dispatched: [${EXTRA_BUILD_FLAGS}]"
+          echo '================ TREATMENT ARM ================'
+          case "$TREATMENT" in
+            none)
+              echo 'ARM none - NO gn gen, NO touch. The restored tree is used exactly as it'
+              echo 'was packed. This is the arm that tests OQ-26 cleanly.'
+              ;;
+            gngen)
+              G0=$(date +%s)
+              gn gen out/Default > /tmp/gngen_full.log 2>&1
+              echo "gn_gen_exit_code=$?"
+              echo "gn_gen_seconds=$(( $(date +%s) - G0 ))"
+              cat /tmp/gngen_full.log
+              echo 'ARM gngen - manifest regenerated, tree NOT touched.'
+              ;;
+            touch)
+              G0=$(date +%s)
+              gn gen out/Default > /tmp/gngen_full.log 2>&1
+              echo "gn_gen_exit_code=$?"
+              echo "gn_gen_seconds=$(( $(date +%s) - G0 ))"
+              cat /tmp/gngen_full.log
+              M0=$(date +%s)
+              find out/Default -exec touch {} +
+              echo "touch_exit_code=$?"
+              echo "touch_seconds=$(( $(date +%s) - M0 ))"
+              echo 'ARM touch - THIS IS THE SUSPECTED DEFECT, REPRODUCED DELIBERATELY (OQ-60).'
+              echo 'If this arm recompiles and arm none does not, the cause was ours all along.'
+              ;;
+            *)
+              echo "F01 FAIL unknown treatment [$TREATMENT] - dispatch again with none, gngen or touch"
+              ;;
+          esac
+          echo '----- THE FOUR TIMESTAMPS (RULE 39) -----'
+          stat -c 'manifest_mtime=%Y %n' out/Default/build.ninja 2>&1
+          find . -path ./out -prune -o -type f -name '*.cc' -printf '%T@ %p\n' 2>/dev/null | sort -rn > /tmp/src_full.txt
+          echo -n 'newest_SOURCE_treewide: '; sed -n 1p /tmp/src_full.txt
+          find out/Default -type f -name '*.o' -printf '%T@ %p\n' 2>/dev/null | sort -rn > /tmp/obj_full.txt
+          echo "object_list_exit_code=$?"
+          echo -n 'newest_OBJECT: '; sed -n 1p /tmp/obj_full.txt
+          echo -n 'oldest_OBJECT: '; tail -n 1 /tmp/obj_full.txt
+          OBJC=$(grep -c '' /tmp/obj_full.txt)
+          echo "object_file_count: $OBJC"
+          echo '----- VALIDITY GATE F01-A - the panel must have something to measure -----'
+          if [ "${OBJC:-0}" -ge 10000 ]; then
+            echo "F01-A PASS $OBJC restored object files are available to sample"
+          else
+            echo "F01-A FAIL only $OBJC object files - the verdict panel would have no power, treat the run as VOID"
+          fi
+          echo '================ BASELINE PANEL - 400 OLDEST OBJECTS, BY MTIME AND BY CONTENT ================'
+          echo 'RULE 42: the OLDEST restored objects are the ones a full restart reaches FIRST.'
+          echo 'D-S4B-10 fix: tail, not head, because the list above is mtime DESCENDING.'
+          tail -n 400 /tmp/obj_full.txt | awk '{print $2}' > /tmp/samp_full.txt
+          : > /tmp/before_full.txt
+          while read -r F; do stat -c '%Y %n' "$F" >> /tmp/before_full.txt 2>/dev/null; done < /tmp/samp_full.txt
+          echo "sampled_objects_mtime: $(grep -c '' /tmp/before_full.txt)"
+          echo '----- SECOND, INDEPENDENT PANEL: CONTENT HASHES OF 20 OF THEM -----'
+          echo 'A mtime panel alone could in principle be fooled by a rebuild that reproduces'
+          echo 'the same timestamp. Hashes cannot be. Two panels that disagree is itself a'
+          echo 'finding and must be reported, not averaged.'
+          sed -n '1,20p' /tmp/samp_full.txt > /tmp/samp20.txt
+          : > /tmp/before_sha.txt
+          while read -r F; do sha256sum "$F" >> /tmp/before_sha.txt 2>/dev/null; done < /tmp/samp20.txt
+          echo "sampled_objects_sha: $(grep -c '' /tmp/before_sha.txt)"
+          sed -n '1,3p' /tmp/before_sha.txt
+          echo '----- PLANNED EDGE COUNT - RECORDED, BUT NOT EVIDENCE (T-14, RULE 43) -----'
+          echo 'Read dry_seconds beside dry_run_lines. A count produced in ~12 s is a manifest'
+          echo 'regeneration transcript, not an enumeration. Real enumeration took 185 s in'
+          echo 'S4B v4. Cold controls for comparison: 62826 / 62822 / 62830 / 62827.'
+          D0=$(date +%s)
+          autoninja -C out/Default -n chrome_public_apk > /tmp/dry_full.log 2>&1
+          echo "dry_exit_code=$?"
+          echo "dry_seconds=$(( $(date +%s) - D0 ))"
+          echo "dry_run_lines: $(grep -c '' /tmp/dry_full.log)"
+          sed -n '1,15p' /tmp/dry_full.log
+
+      - name: F02 THE UNBOUNDED BUILD - in-loop VERDICT, then two non-killing checkpoints
+        run: |
+          set +e
+          export PATH="$GITHUB_WORKSPACE/depot_tools:$PATH"
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo '================ THE LINES THAT DEFINE THIS RUN - READ THESE FIRST ================'
+          echo "USE_SNAPSHOT_AS_DISPATCHED=$USE_SNAPSHOT"
+          echo "TREATMENT_AS_DISPATCHED=$TREATMENT"
+          echo "SNAPSHOT_TAG_AS_DISPATCHED=$SNAPSHOT_TAG"
+          echo "VERDICT_AT_SECONDS=$VERDICT_AT_SECONDS"
+          echo "CHECKPOINT_AT_SECONDS=$CHECKPOINT_AT_SECONDS"
+          echo "FINAL_CHECKPOINT_AT_SECONDS=$FINAL_CHECKPOINT_AT_SECONDS"
+          echo "EXTRA_BUILD_FLAGS=[${EXTRA_BUILD_FLAGS}]"
+          echo 'If USE_SNAPSHOT reads no above, this is a COLD build and it does NOT test'
+          echo 'OQ-26. That is exactly the mistake W7 made and it must never be repeated.'
+          echo 'THERE IS NO KILL AND NO TIMEOUT ANYWHERE IN THIS STEP. The checkpoints use'
+          echo 'SIGSTOP and SIGCONT, which suspend and resume. Nothing is terminated.'
+          echo 'C9: --clobber is NOT passed to the build. siso_tips.md defines it as "Rerun'
+          echo 'steps even if outputs seems to be up-to-date", which would silently destroy'
+          echo 'this experiment while appearing to succeed.'
+          verdict_panel() {
+            WHEN="$1"
+            if [ "$USE_SNAPSHOT" != yes ] || [ ! -f /tmp/before_full.txt ]; then
+              echo "VERDICT[$WHEN]: NOT APPLICABLE - this run was dispatched cold, OQ-26 is untested by it (RULE 44)"
+              return 0
+            fi
+            RECOMP=0
+            UNTOUCHED=0
+            MISSING=0
+            while read -r OLDT F; do
+              NEWT=$(stat -c '%Y' "$F" 2>/dev/null)
+              if [ -z "$NEWT" ]; then
+                MISSING=$(( MISSING + 1 ))
+              elif [ "$NEWT" != "$OLDT" ]; then
+                RECOMP=$(( RECOMP + 1 ))
+              else
+                UNTOUCHED=$(( UNTOUCHED + 1 ))
+              fi
+            done < /tmp/before_full.txt
+            TOTAL=$(( RECOMP + UNTOUCHED + MISSING ))
+            SHACHANGED=0
+            SHASAME=0
+            while read -r OLDH F; do
+              NEWH=$(sha256sum "$F" 2>/dev/null | cut -d' ' -f1)
+              if [ "$NEWH" = "$OLDH" ]; then SHASAME=$(( SHASAME + 1 )); else SHACHANGED=$(( SHACHANGED + 1 )); fi
+            done < /tmp/before_sha.txt
+            echo "VERDICT[$WHEN] panel_total: $TOTAL  untouched: $UNTOUCHED  recompiled: $RECOMP  missing: $MISSING"
+            echo "VERDICT[$WHEN] hash_panel same: $SHASAME  changed: $SHACHANGED"
+            LASTPV=$(grep -oE '\\[[0-9]+/[0-9]+\\]' /tmp/build.log 2>/dev/null | tail -n 1)
+            echo "VERDICT[$WHEN] progress_at_verdict: ${LASTPV:-none}"
+            echo "VERDICT[$WHEN] build_elapsed_seconds: $WHEN"
+            if [ "$TOTAL" -lt 100 ]; then
+              echo "VERDICT[$WHEN] RESUME=INDETERMINATE - the panel is too small to have power"
+            elif [ "$UNTOUCHED" -ge $(( TOTAL * 95 / 100 )) ] && [ "$SHACHANGED" -eq 0 ]; then
+              echo "VERDICT[$WHEN] RESUME=YES - the oldest restored objects were NOT rewritten after $WHEN s of building. Restored objects ARE being reused."
+            elif [ "$RECOMP" -ge $(( TOTAL * 50 / 100 )) ]; then
+              echo "VERDICT[$WHEN] RESUME=NO - the majority of the oldest restored objects were rewritten. The tool is recompiling work it was handed."
+            else
+              echo "VERDICT[$WHEN] RESUME=PARTIAL - some objects reused, some rewritten. Report both numbers, do not round to a yes or a no."
+            fi
+          }
+          do_checkpoint() {
+            CKLABEL="$1"
+            CKELAPSED="$2"
+            echo "================ CHECKPOINT $CKLABEL - SUSPEND, SAVE, RESUME ================"
+            echo 'A-027-01 and D-S4B-11 fix: the build is SUSPENDED before tar runs, so tar'
+            echo 'cannot read a file while it is being written. SIGSTOP is not a kill.'
+            DESC=$(ps -eo pid=,ppid= | awk -v root="$BPID" '{p[$1]=$2} END{n=1; l[1]=root; for(i=1;i<=n;i++){for(k in p){if(p[k]==l[i]){n++; l[n]=k}}} for(i=1;i<=n;i++) print l[i]}')
+            echo "checkpoint_process_tree: $(echo $DESC | tr '\n' ' ')"
+            for P in $DESC; do kill -STOP "$P" 2>/dev/null; done
+            sleep 10
+            echo "suspended_process_states: $(ps -o pid=,stat=,comm= -p $(echo $DESC | tr '\n' ',' | sed 's/,$//') 2>/dev/null | tr '\n' ';')"
+            CKD="$GITHUB_WORKSPACE/ckpt"
+            rm -rf "$CKD"
+            mkdir -p "$CKD"
+            echo "checkpoint_out_default_mb: $(du -sm out/Default | cut -f1)"
+            CFC=$(find out/Default -type f | grep -c '')
+            echo "checkpoint_file_count: $CFC"
+            T0=$(date +%s)
+            tar -I 'zstd -3 -T0' -cf "$CKD/outdefault.tar.zst" out/Default 2>/tmp/ckpt_tar.log
+            CTRC=$?
+            echo "checkpoint_tar_exit_code=$CTRC"
+            echo "checkpoint_pack_seconds=$(( $(date +%s) - T0 ))"
+            echo '----- checkpoint tar stderr in full -----'
+            cat /tmp/ckpt_tar.log
+            echo "checkpoint_packed_bytes: $(stat -c%s "$CKD/outdefault.tar.zst" 2>/dev/null)"
+            sha256sum "$CKD/outdefault.tar.zst" > "$CKD/outdefault.sha256"
+            cat "$CKD/outdefault.sha256"
+            CENT=$(tar -I zstd -tf "$CKD/outdefault.tar.zst" 2>/dev/null | grep -c '')
+            echo "checkpoint_listed_entries: $CENT"
+            echo '----- VALIDITY GATE CHECKPOINT - this gate can actually FAIL -----'
+            if [ "$CTRC" -eq 0 ] && [ "$CENT" -ge "$CFC" ]; then
+              echo "CHECKPOINT $CKLABEL PASS the mid-run snapshot is complete and readable"
+            else
+              echo "CHECKPOINT $CKLABEL FAIL tar_exit=$CTRC entries=$CENT packed=$CFC - mark this tag SUSPECT and do not resume from it"
+            fi
+            ( cd "$CKD" && split -b 1900M -d -a 3 outdefault.tar.zst part. && sha256sum part.* > parts.sha256 && ls -l )
+            CTAG="ckpt-${GITHUB_RUN_ID}-${CKLABEL}"
+            echo "checkpoint_tag=$CTAG"
+            gh release create "$CTAG" --draft --notes "out/Default checkpoint $CKLABEL taken at ${CKELAPSED}s without killing the build, run $GITHUB_RUN_ID, treatment $TREATMENT" 2>&1 | tail -n 2
+            for f in "$CKD"/part.* "$CKD"/parts.sha256 "$CKD"/outdefault.sha256; do gh release upload "$CTAG" "$f" --clobber 2>&1 | tail -n 1; done
+            echo "checkpoint_assets: $(gh release view "$CTAG" --json assets --jq '.assets | length' 2>/dev/null)"
+            rm -f "$CKD"/part.* "$CKD/outdefault.tar.zst"
+            echo "disk_free_mb_after_checkpoint: $(df -m . | awk 'NR==2{print $4}')"
+            for P in $DESC; do kill -CONT "$P" 2>/dev/null; done
+            echo "resumed_process_states: $(ps -o pid=,stat=,comm= -p $(echo $DESC | tr '\n' ',' | sed 's/,$//') 2>/dev/null | tr '\n' ';')"
+            echo "================ CHECKPOINT $CKLABEL COMPLETE - THE BUILD IS RUNNING AGAIN ================"
+          }
+          START=$(date +%s)
+          echo "build_start_epoch=$START"
+          autoninja -C out/Default chrome_public_apk $EXTRA_BUILD_FLAGS > /tmp/build.log 2>&1 &
+          BPID=$!
+          echo "build_pid=$BPID"
+          VERDICT_DONE=0
+          CHECKPOINT_DONE=0
+          FINAL_CHECKPOINT_DONE=0
+          while kill -0 "$BPID" 2>/dev/null; do
+            EL=$(( $(date +%s) - START ))
+            LASTP=$(grep -oE '\\[[0-9]+/[0-9]+\\]' /tmp/build.log 2>/dev/null | tail -n 1)
+            ERRC=$(grep -cE 'FAILED:|error:' /tmp/build.log 2>/dev/null)
+            echo "SAMPLE elapsed=${EL}s progress=${LASTP:-none} errors=${ERRC:-0} load=$(cut -d' ' -f1-3 /proc/loadavg) $(free -m | awk '/^Mem:/{print "memused="$3" avail="$7}') disk_free_mb=$(df -m . | awk 'NR==2{print $4}')"
+            if [ "$VERDICT_DONE" -eq 0 ] && [ "$EL" -ge "$VERDICT_AT_SECONDS" ]; then
+              VERDICT_DONE=1
+              echo '================ OQ-26 VERDICT - COMPUTED INSIDE THE LOOP, BEFORE ANY WALL ================'
+              verdict_panel "$EL"
+              echo '----- head of the build log, 40 lines, printed here so cancellation cannot hide it -----'
+              sed -n '1,40p' /tmp/build.log
+              echo '================ END VERDICT ================'
+            fi
+            if [ "$CHECKPOINT_DONE" -eq 0 ] && [ "$EL" -ge "$CHECKPOINT_AT_SECONDS" ]; then
+              CHECKPOINT_DONE=1
+              do_checkpoint mid "$EL"
+            fi
+            if [ "$FINAL_CHECKPOINT_DONE" -eq 0 ] && [ "$EL" -ge "$FINAL_CHECKPOINT_AT_SECONDS" ]; then
+              FINAL_CHECKPOINT_DONE=1
+              do_checkpoint final "$EL"
+            fi
+            sleep "$SAMPLE_INTERVAL_SECONDS"
+          done
+          wait "$BPID"
+          RC=$?
+          echo "build_exit_code=$RC"
+          echo "elapsed_build_seconds=$(( $(date +%s) - START ))"
+          echo 'NOTE: nothing in this workflow sends a terminating signal. An exit 137 here'
+          echo 'would mean something external killed the compile, not us.'
+          echo '----- VERDICT RECOMPUTED AT BUILD END -----'
+          verdict_panel "$(( $(date +%s) - START ))"
+          echo '----- VALIDITY GATE F02 -----'
+          FIRSTVALID=$(grep -oE '\\[[0-9]+/[0-9]+\\]' /tmp/build.log 2>/dev/null | awk -F'[][/]' '$3 >= 1000' | sed -n 1p)
+          if [ -n "$FIRSTVALID" ]; then
+            echo 'F02 PASS a real compile schedule was observed'
+          else
+            echo 'F02 FAIL no progress line with a plausible denominator - the compile never started'
+          fi
+          echo 'All interpretive readings are ALSO emitted by step F06, which runs even if'
+          echo 'this step is cancelled. Nothing important lives behind the wait above.'
+
+      - name: F03 LOCATE AND VERIFY THE APK - do not guess its filename
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          echo '----- every apk produced anywhere in the tree -----'
+          find out/Default -name '*.apk' -printf '%s  %p\n' 2>/dev/null | sort -rn > /tmp/apks.txt
+          cat /tmp/apks.txt
+          echo "apk_count: $(grep -c '' /tmp/apks.txt)"
+          APK=$(sed -n 1p /tmp/apks.txt | awk '{print $2}')
+          echo "largest_apk_path: ${APK:-none}"
+          if [ -n "$APK" ]; then
+            echo "apk_bytes: $(stat -c%s "$APK")"
+            echo "apk_sha256: $(sha256sum "$APK" | cut -d' ' -f1)"
+            sha256sum "$APK" > /tmp/apk.sha256
+            echo "$APK" > /tmp/apk_path.txt
+            echo '----- native libraries inside it (answers the 207 MB question directly) -----'
+            unzip -l "$APK" | grep '\.so' | head -40
+          fi
+          echo '----- VALIDITY GATE F03 -----'
+          if [ -n "$APK" ] && [ "$(stat -c%s "$APK" 2>/dev/null || echo 0)" -ge 50000000 ]; then
+            echo 'F03 PASS an APK of plausible size exists'
+          else
+            echo 'F03 FAIL no APK - the build did not reach the packaging step'
+          fi
+
+      - name: F04 PUBLISH THE APK AS A REAL RELEASE - visible under Tags
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          APK=$(cat /tmp/apk_path.txt 2>/dev/null)
+          if [ -z "$APK" ]; then echo 'F04 SKIPPED - there is no APK to publish'; exit 0; fi
+          cp "$APK" "$GITHUB_WORKSPACE/titanium-baseline-arm64.apk"
+          cp /tmp/apk.sha256 "$GITHUB_WORKSPACE/titanium-baseline-arm64.apk.sha256"
+          cd "$GITHUB_WORKSPACE"
+          echo "release_tag=$RELEASE_TAG"
+          gh release create "$RELEASE_TAG" --title "Titanium baseline arm64-v8a (unmodified fork)" --notes "Unmodified Titanium 150.0.7871.124 baseline, arm64-v8a only, no multi-profile patch. Built by run $GITHUB_RUN_ID." 2>&1 | tail -n 3
+          echo "release_create_exit_code=$?"
+          gh release upload "$RELEASE_TAG" titanium-baseline-arm64.apk titanium-baseline-arm64.apk.sha256 --clobber 2>&1 | tail -n 3
+          echo "release_upload_exit_code=$?"
+          echo "assets_now: $(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length' 2>/dev/null)"
+          gh release view "$RELEASE_TAG" --json isDraft,tagName,url --jq '.' 2>/dev/null
+          echo '----- VALIDITY GATE F04 -----'
+          if [ "$(gh release view "$RELEASE_TAG" --json assets --jq '.assets | length' 2>/dev/null)" -ge 2 ]; then
+            echo 'F04 PASS the APK is published and downloadable under Releases'
+          else
+            echo 'F04 FAIL the release does not carry both assets'
+          fi
+
+      - name: F05 SAVE THE WARM TREE - the asset every patched build will start from
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src"
+          SNAPDIR="$GITHUB_WORKSPACE/save"
+          mkdir -p "$SNAPDIR"
+          echo "out_default_mb: $(du -sm out/Default | cut -f1)"
+          FC=$(find out/Default -type f | grep -c '')
+          echo "file_count_before_pack: $FC"
+          T0=$(date +%s)
+          tar -I 'zstd -3 -T0' -cf "$SNAPDIR/outdefault.tar.zst" out/Default 2>/tmp/tar.log
+          TRC=$?
+          echo "tar_exit_code=$TRC"
+          echo "pack_seconds=$(( $(date +%s) - T0 ))"
+          echo '----- tar stderr in full -----'
+          cat /tmp/tar.log
+          echo "packed_bytes: $(stat -c%s "$SNAPDIR/outdefault.tar.zst")"
+          echo "packed_sha256: $(sha256sum "$SNAPDIR/outdefault.tar.zst" | cut -d' ' -f1)"
+          echo '----- integrity: can it be read back? -----'
+          I0=$(date +%s)
+          ENTRIES=$(tar -I zstd -tf "$SNAPDIR/outdefault.tar.zst" 2>/tmp/tarlist.log | grep -c '')
+          echo "listed_entries: $ENTRIES"
+          echo "list_seconds=$(( $(date +%s) - I0 ))"
+          echo '----- VALIDITY GATE F05 - D-S4B-11 FIX, this gate can actually FAIL -----'
+          echo 'A non-empty file is NOT evidence. tar must exit 0 AND the archive must list'
+          echo 'back at least as many entries as we packed.'
+          if [ "$TRC" -eq 0 ] && [ "$ENTRIES" -ge "$FC" ]; then
+            echo 'F05 PASS snapshot is complete and readable - safe to use as a resume source'
+          else
+            echo "F05 FAIL tar_exit=$TRC entries=$ENTRIES packed=$FC - mark this snapshot SUSPECT, do not resume from it"
+          fi
+          cd "$SNAPDIR"
+          split -b 1900M -d -a 3 outdefault.tar.zst part.
+          sha256sum part.* > parts.sha256
+          ls -l
+          TAG="warmtree-${GITHUB_RUN_ID}"
+          echo "warm_tree_tag=$TAG"
+          gh release create "$TAG" --draft --notes "Warm out/Default after the baseline APK build, run $GITHUB_RUN_ID" 2>&1 | tail -n 2
+          for f in part.* parts.sha256; do gh release upload "$TAG" "$f" --clobber 2>&1 | tail -n 1; done
+          echo "warm_tree_assets: $(gh release view "$TAG" --json assets --jq '.assets | length' 2>/dev/null)"
+
+      - name: F06 POST-MORTEM AND THE STANDING VERDICT - runs even if the build was cancelled
+        if: always()
+        run: |
+          set +e
+          cd "$GITHUB_WORKSPACE/chromium/src" 2>/dev/null
+          echo 'D-W7-05 FIX. Every reading below is taken by RE-READING files from disk in a'
+          echo 'SEPARATE step, so a cancellation of the build step cannot suppress it.'
+          echo 'RULE 45: the PRESENCE of this step proves nothing about whether the job was'
+          echo 'killed - it carries if: always(). Do not use it as evidence either way.'
+          if [ ! -f /tmp/build.log ]; then
+            echo 'F06 no build log exists - the build step never started'
+            exit 0
+          fi
+          echo "build_log_bytes: $(stat -c%s /tmp/build.log)"
+          echo '----- HEAD OF THE BUILD LOG, 60 LINES (D-S4B-05 fix) -----'
+          sed -n '1,60p' /tmp/build.log
+          echo '----- LAST 60 LINES -----'
+          tail -n 60 /tmp/build.log
+          echo '----- PROGRESS READINGS (RULE 38 - validate the DENOMINATOR) -----'
+          FIRSTANY=$(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log | sed -n 1p)
+          FIRSTVALID=$(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log | awk -F'[][/]' '$3 >= 1000' | sed -n 1p)
+          echo "first_ANY_progress_line: ${FIRSTANY:-none}   <-- [0/2] is manifest regeneration, NOT the compile"
+          echo "first_VALID_progress_line: ${FIRSTVALID:-none}"
+          echo "final_progress: $(grep -oE '\[[0-9]+/[0-9]+\]' /tmp/build.log | tail -n 1)"
+          echo "error_lines: $(grep -cE 'FAILED:|error:' /tmp/build.log)"
+          echo '----- FIRST 20 ERROR LINES, IF THERE ARE ANY -----'
+          grep -nE 'FAILED:|error:' /tmp/build.log | head -n 20
+          echo '================ THE OQ-26 VERDICT, RECOMPUTED FROM DISK ================'
+          if [ "$USE_SNAPSHOT" != yes ]; then
+            echo 'RESUME=NOT APPLICABLE - this run was dispatched cold (use_snapshot=no).'
+            echo 'OQ-26 is untested by it. RULE 44: that is not a NO, it is an absence of a test.'
+            exit 0
+          fi
+          if [ ! -f /tmp/before_full.txt ]; then
+            echo 'RESUME=VOID - the baseline panel file is missing, so F01 never completed.'
+            echo 'No verdict can be issued and none should be inferred.'
+            exit 0
+          fi
+          RECOMP=0
+          UNTOUCHED=0
+          MISSING=0
+          while read -r OLDT F; do
+            NEWT=$(stat -c '%Y' "$F" 2>/dev/null)
+            if [ -z "$NEWT" ]; then
+              MISSING=$(( MISSING + 1 ))
+            elif [ "$NEWT" != "$OLDT" ]; then
+              RECOMP=$(( RECOMP + 1 ))
+            else
+              UNTOUCHED=$(( UNTOUCHED + 1 ))
+            fi
+          done < /tmp/before_full.txt
+          TOTAL=$(( RECOMP + UNTOUCHED + MISSING ))
+          SHACHANGED=0
+          SHASAME=0
+          while read -r OLDH F; do
+            NEWH=$(sha256sum "$F" 2>/dev/null | cut -d' ' -f1)
+            if [ "$NEWH" = "$OLDH" ]; then SHASAME=$(( SHASAME + 1 )); else SHACHANGED=$(( SHACHANGED + 1 )); fi
+          done < /tmp/before_sha.txt
+          echo "treatment_arm: $TREATMENT"
+          echo "panel_total: $TOTAL"
+          echo "objects_UNTOUCHED: $UNTOUCHED"
+          echo "objects_RECOMPILED: $RECOMP"
+          echo "objects_MISSING: $MISSING"
+          echo "hash_panel_same: $SHASAME"
+          echo "hash_panel_changed: $SHACHANGED"
+          echo 'POWER STATEMENT (RULE 42): this sample is the 400 OLDEST restored objects and'
+          echo 'the build above ran for the elapsed time printed by F02, not for 180 s. A'
+          echo 'from-scratch build reaches these objects FIRST, so a high UNTOUCHED count'
+          echo 'after a long window cannot be produced by a restart. This is why this reading'
+          echo 'is admissible where S4B v4 zero was not.'
+          if [ "$TOTAL" -lt 100 ]; then
+            echo 'RESUME=INDETERMINATE - panel too small to have power. Do not read a yes or a no into it.'
+          elif [ "$UNTOUCHED" -ge $(( TOTAL * 95 / 100 )) ] && [ "$SHACHANGED" -eq 0 ]; then
+            echo 'RESUME=YES - restored objects ARE reused across machines. OQ-26 ANSWERED YES.'
+          elif [ "$RECOMP" -ge $(( TOTAL * 50 / 100 )) ]; then
+            echo "RESUME=NO - restored objects are being recompiled under treatment [$TREATMENT]. OQ-26 ANSWERED NO for this arm."
+          else
+            echo 'RESUME=PARTIAL - report both numbers verbatim. Do not round a partial result into a yes or a no.'
+          fi
+
+      - name: F07 FINAL SUMMARY - what this run can and cannot testify to
+        if: always()
+        run: |
+          set +e
+          echo '================ HOW TO READ THIS RUN ================'
+          echo 'RULE 45. This step carries if: always(), so its PRESENCE PROVES NOTHING about'
+          echo 'whether the job was killed. This is the exact defect D-W7-04 that W7 shipped'
+          echo 'with. The platform killed the job if and only if ALL THREE are true:'
+          echo '  1. ##[error]The operation was canceled. appears inside the step that was running'
+          echo '  2. steps F03, F04 and F05 are missing from the log entirely'
+          echo '  3. the job duration is at or near 6.0 hours'
+          echo 'W7 measured that wall at 21612.414 s = 6.0034 h on run 31351367933.'
+          echo '----- THE ANSWER THIS RUN WAS DISPATCHED TO PRODUCE -----'
+          echo 'Search this log for the string RESUME= . It appears at least twice: once from'
+          echo 'inside the build loop at verdict_at_seconds, and once in F06. Both are computed'
+          echo 'from the same two panels. If they disagree, report BOTH and treat the run as'
+          echo 'anomalous rather than picking the convenient one.'
+          echo "run_id: $GITHUB_RUN_ID"
+          echo "use_snapshot_as_dispatched: $USE_SNAPSHOT"
+          echo "treatment_as_dispatched: $TREATMENT"
+          echo "snapshot_tag: $SNAPSHOT_TAG"
+          echo "release_tag_requested: $RELEASE_TAG"
+          echo "verdict_at_seconds: $VERDICT_AT_SECONDS"
+          echo "checkpoint_at_seconds: $CHECKPOINT_AT_SECONDS"
+          echo "final_checkpoint_at_seconds: $FINAL_CHECKPOINT_AT_SECONDS"
+          echo "extra_build_flags: [${EXTRA_BUILD_FLAGS}]"
+          echo "checkpoint_tags_if_reached: ckpt-$GITHUB_RUN_ID-mid and ckpt-$GITHUB_RUN_ID-final"
+          echo 'If either checkpoint tag exists as a draft release with assets, the compiled'
+          echo 'work of this run SURVIVED even if the job itself did not. That is the C11'
+          echo 'guarantee and it is the reason W7 cannot repeat itself.'
+          df -h /
+          free -m
